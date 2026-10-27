@@ -131,5 +131,7 @@ npm run build
 
 Фактические результаты, трассируемость и исправленные дефекты находятся в [docs/VERIFICATION_VALIDATION.md](docs/VERIFICATION_VALIDATION.md).
 
+Настройка GitHub Actions, веток `dev`/`main`, production-сервера, секретов, автоматического развёртывания и rollback описана в [docs/CI_CD.md](docs/CI_CD.md).
+
 Ограничения MVP: нет оплаты, CRM/1С, уведомлений, клиентских аккаунтов и подтверждённого производственного экономического эффекта; keyword retrieval не является семантическим поиском; rate limit хранится в памяти процесса. Для публичного размещения необходим HTTPS reverse proxy, `COOKIE_SECURE=true`, сильные секреты, политика резервного копирования и дополнительный security review.
 
