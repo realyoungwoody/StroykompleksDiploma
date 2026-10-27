@@ -10,7 +10,9 @@ backend/data/
 frontend/node_modules/
 frontend/dist/
 frontend/coverage/
+*.tsbuildinfo
 .DS_Store
+DiplomaText.docx
 playwright-report/
 test-results/
 

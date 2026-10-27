@@ -1,1 +1,0 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/api/client.ts","./src/components/assistantchat.tsx","./src/components/layout.tsx","./src/components/servicecard.tsx","./src/components/ui.tsx","./src/contexts/cartcontext.tsx","./src/pages/publicpages.tsx","./src/pages/admin/adminpages.tsx","./src/types/index.ts","./tests/setup.ts","./tests/ui.test.tsx"],"version":"5.7.2"}
