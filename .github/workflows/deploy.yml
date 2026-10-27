@@ -1,0 +1,119 @@
+name: Deploy Production
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy-production
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      PRODUCTION_URL: ${{ vars.PRODUCTION_URL }}
+    steps:
+      - name: Validate deployment settings
+        run: |
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_PATH"
+          test -n "$PRODUCTION_URL"
+          [[ "$VERIFIED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          (( DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535 ))
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._:-]+$ ]]
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]]
+          test "$DEPLOY_PATH" != "/"
+          [[ "$PRODUCTION_URL" =~ ^https://[A-Za-z0-9._:/-]+$ ]]
+
+      - name: Verify checked SHA is current main HEAD
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_sha=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["object"]["sha"])')
+          test "$current_sha" = "$VERIFIED_SHA"
+
+      - name: Checkout verified commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+
+      - name: Create immutable source archive
+        run: |
+          test "$(git rev-parse HEAD)" = "$VERIFIED_SHA"
+          git archive --format=tar.gz --output="release-$VERIFIED_SHA.tar.gz" "$VERIFIED_SHA"
+
+      - name: Configure verified SSH host key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Upload verified release
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p '$DEPLOY_PATH/shared/incoming'"
+          scp -P "$DEPLOY_PORT" \
+            "release-$VERIFIED_SHA.tar.gz" \
+            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/shared/incoming/$VERIFIED_SHA.tar.gz"
+
+      - name: Deploy, healthcheck and retain rollback release
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "bash -s -- '$DEPLOY_PATH' '$VERIFIED_SHA' '$PRODUCTION_URL'" \
+            < scripts/deploy_release.sh
+
+      - name: Verify public HTTPS endpoint
+        run: |
+          curl --fail --silent --show-error --location \
+            --retry 10 --retry-delay 3 --retry-all-errors --max-time 10 \
+            "${PRODUCTION_URL%/}/api/v1/health"
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-delay 2 --retry-all-errors --max-time 10 \
+            "${PRODUCTION_URL%/}/" >/dev/null
+
+      - name: Record deployment summary
+        run: |
+          {
+            echo "### Production deployment"
+            echo "- Commit: \`$VERIFIED_SHA\`"
+            echo "- URL: $PRODUCTION_URL"
+            echo "- Result: health checks passed"
+          } >> "$GITHUB_STEP_SUMMARY"
