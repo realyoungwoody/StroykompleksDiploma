@@ -98,15 +98,14 @@ cd backend
 ../.venv/bin/pytest -q
 ```
 
-Frontend (зависимости зафиксированы в `pnpm-lock.yaml`):
+Frontend (зависимости зафиксированы в `package-lock.json`):
 
 ```bash
 cd frontend
-corepack enable
-pnpm install --frozen-lockfile
-pnpm run typecheck
-pnpm test
-pnpm run build
+npm ci
+npm run typecheck
+npm test
+npm run build
 ```
 
 После Docker-запуска:
