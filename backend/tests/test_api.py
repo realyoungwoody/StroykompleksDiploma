@@ -222,6 +222,89 @@ def test_llm_success_is_visible(monkeypatch):
     assert "warning" not in result
 
 
+def test_llm_retries_temporary_503_before_success(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+    attempts = 0
+    delays = []
+
+    def post(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(
+                503,
+                request=httpx.Request(
+                    "POST", "https://provider.example/v1/chat/completions"
+                ),
+                json={"error": {"message": "temporarily unavailable"}},
+            )
+        return httpx.Response(
+            200,
+            request=httpx.Request(
+                "POST", "https://provider.example/v1/chat/completions"
+            ),
+            json={"choices": [{"message": {"content": "Ответ после повтора"}}]},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    monkeypatch.setattr(assistant.time, "sleep", delays.append)
+    with SessionLocal() as db:
+        result = assistant.client_answer(db, ChatIn(message="Какие есть услуги?"))
+    assert attempts == 3
+    assert delays == [0.25, 0.75]
+    assert result["mode"] == "llm"
+    assert result["answer"] == "Ответ после повтора"
+    assert "warning" not in result
+
+
+def test_llm_does_not_retry_permanent_404(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+    attempts = 0
+
+    def post(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            404,
+            request=httpx.Request(
+                "POST", "https://provider.example/v1/chat/completions"
+            ),
+            json={"error": {"message": "model not found"}},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    monkeypatch.setattr(assistant.time, "sleep", lambda _delay: None)
+    with SessionLocal() as db:
+        result = assistant.client_answer(db, ChatIn(message="Какие есть услуги?"))
+    assert attempts == 1
+    assert result["mode"] == "demo"
+    assert "недоступна" in result["warning"]
+
+
+def test_llm_warns_only_after_temporary_retries_are_exhausted(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+    attempts = 0
+
+    def post(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            503,
+            request=httpx.Request(
+                "POST", "https://provider.example/v1/chat/completions"
+            ),
+            json={"error": {"message": "high demand"}},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    monkeypatch.setattr(assistant.time, "sleep", lambda _delay: None)
+    with SessionLocal() as db:
+        result = assistant.client_answer(db, ChatIn(message="Какие есть услуги?"))
+    assert attempts == 3
+    assert result["mode"] == "demo"
+    assert "временно недоступен" in result["warning"]
+
+
 def test_assistant_returns_verified_cart_action_with_quantity():
     with SessionLocal() as db:
         result = assistant.demo_client_answer(
