@@ -365,12 +365,15 @@ def test_assistant_preserves_preference_and_conversation_action():
                 ],
                 context_actions=[
                     ChatActionContext(
+                        calculation_id=first["calculation_id"],
+                        conversation_id=action["conversation_id"],
                         service_id=action["service_id"],
                         quantity=action["quantity"],
                         unit=action["unit"],
                         note=action["note"],
                     )
                 ],
+                context_calculation_id=first["calculation_id"],
             ),
         )
     assert follow_up["cart_actions"][0]["service_id"] == action["service_id"]
@@ -385,6 +388,8 @@ def test_assistant_updates_context_quantity_and_knows_cart_state():
         )
         action = first["cart_actions"][0]
         context = ChatActionContext(
+            calculation_id=first["calculation_id"],
+            conversation_id=action["conversation_id"],
             service_id=action["service_id"],
             quantity=action["quantity"],
             unit=action["unit"],
@@ -395,17 +400,97 @@ def test_assistant_updates_context_quantity_and_knows_cart_state():
             ChatIn(
                 message="Измени площадь на 75 м²",
                 context_actions=[context],
+                context_calculation_id=first["calculation_id"],
                 cart=[cart],
             ),
         )
         next_step = assistant.demo_client_answer(
             db,
-            ChatIn(message="Что дальше?", context_actions=[context], cart=[cart]),
+            ChatIn(
+                message="Что дальше?",
+                context_actions=[context],
+                context_calculation_id=first["calculation_id"],
+                cart=[cart],
+            ),
         )
     assert changed["cart_actions"][0]["action"] == "set_cart_quantity"
     assert changed["cart_actions"][0]["quantity"] == Decimal("75.00")
     assert next_step["navigate_to"] == "/cart"
     assert "оформлению" in next_step["answer"]
+
+
+def test_assistant_versions_are_unique_and_bound_to_conversation():
+    with SessionLocal() as db:
+        first = assistant.demo_client_answer(
+            db, ChatIn(message="Натяжной потолок 50 м²", conversation_id="chat-first")
+        )
+        second = assistant.demo_client_answer(
+            db, ChatIn(message="Натяжной потолок 50 м²", conversation_id="chat-second")
+        )
+    assert first["calculation_id"] != second["calculation_id"]
+    assert first["cart_actions"][0]["conversation_id"] == "chat-first"
+    assert second["cart_actions"][0]["conversation_id"] == "chat-second"
+
+
+def test_assistant_rejects_stale_or_foreign_context():
+    with SessionLocal() as db:
+        first = assistant.demo_client_answer(
+            db, ChatIn(message="Натяжной потолок 50 м²", conversation_id="chat-owner")
+        )
+        action = first["cart_actions"][0]
+        context = ChatActionContext(
+            calculation_id=first["calculation_id"],
+            conversation_id="chat-owner",
+            service_id=action["service_id"],
+            quantity=action["quantity"],
+            unit=action["unit"],
+        )
+        stale = assistant.demo_client_answer(
+            db,
+            ChatIn(
+                message="А если 75 м²?",
+                conversation_id="chat-owner",
+                context_calculation_id="stale-version",
+                context_actions=[context],
+            ),
+        )
+        foreign = assistant.demo_client_answer(
+            db,
+            ChatIn(
+                message="А если 75 м²?",
+                conversation_id="chat-other",
+                context_calculation_id=first["calculation_id"],
+                context_actions=[context],
+            ),
+        )
+    assert stale["cart_actions"] == []
+    assert foreign["cart_actions"] == []
+
+
+def test_explicit_service_switch_does_not_reuse_previous_service():
+    with SessionLocal() as db:
+        first = assistant.demo_client_answer(
+            db, ChatIn(message="Натяжной потолок 50 м²", conversation_id="chat-switch")
+        )
+        action = first["cart_actions"][0]
+        switched = assistant.demo_client_answer(
+            db,
+            ChatIn(
+                message="Покраска стен 30 м²",
+                conversation_id="chat-switch",
+                context_calculation_id=first["calculation_id"],
+                context_actions=[
+                    ChatActionContext(
+                        calculation_id=first["calculation_id"],
+                        conversation_id="chat-switch",
+                        service_id=action["service_id"],
+                        quantity=action["quantity"],
+                        unit=action["unit"],
+                    )
+                ],
+            ),
+        )
+    assert switched["cart_actions"][0]["service_id"] != action["service_id"]
 
 
 def test_llm_http_error_returns_demo_with_warning(monkeypatch):
