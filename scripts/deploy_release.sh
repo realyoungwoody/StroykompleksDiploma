@@ -30,7 +30,11 @@ fi
 
 compose_for() {
   local directory=$1
-  docker compose -p "$compose_project" --env-file "$shared_dir/.env" -f "$directory/docker-compose.yml" "${@:2}"
+  local profile_args=()
+  if grep -Eq '^LLM_MODE=local([[:space:]]*)$' "$shared_dir/.env"; then
+    profile_args=(--profile local)
+  fi
+  docker compose -p "$compose_project" --env-file "$shared_dir/.env" -f "$directory/docker-compose.yml" "${profile_args[@]}" "${@:2}"
 }
 
 healthcheck() {
@@ -44,6 +48,32 @@ healthcheck() {
     fi
     sleep 3
   done
+  return 1
+}
+
+wait_for_local_model() {
+  if ! grep -Eq '^LLM_MODE=local([[:space:]]*)$' "$shared_dir/.env"; then
+    return 0
+  fi
+  local init_container attempt status exit_code
+  for ((attempt=1; attempt<=360; attempt++)); do
+    init_container=$(compose_for "$release_dir" ps -aq ollama-init 2>/dev/null || true)
+    if [[ -n "$init_container" ]]; then
+      status=$(docker inspect -f '{{.State.Status}}' "$init_container")
+      if [[ "$status" == "exited" ]]; then
+        exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$init_container")
+        if [[ "$exit_code" == "0" ]]; then
+          echo "Local model readiness check passed"
+          return 0
+        fi
+        compose_for "$release_dir" logs --no-color ollama-init >&2 || true
+        return 1
+      fi
+    fi
+    sleep 5
+  done
+  echo "Local model was not ready after 30 minutes" >&2
+  compose_for "$release_dir" logs --no-color --tail=200 ollama ollama-init >&2 || true
   return 1
 }
 
@@ -110,6 +140,7 @@ fi
 deployment_started=1
 compose_for "$release_dir" up -d --remove-orphans
 healthcheck 30
+wait_for_local_model
 compose_for "$release_dir" ps
 if [[ -n "$production_url" ]]; then
   curl -fsS --location --retry 10 --retry-delay 3 --retry-all-errors --max-time 10 \

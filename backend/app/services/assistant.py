@@ -6,6 +6,7 @@ import secrets
 import time
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import func, select
@@ -22,6 +23,8 @@ LLM_RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
 def _llm_warning(exc: Exception, model: str) -> str:
+    is_local = _llm_provider() == "local"
+    source = "локальная модель" if is_local else "ИИ API"
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         if status in (401, 403):
@@ -40,25 +43,34 @@ def _llm_warning(exc: Exception, model: str) -> str:
             model,
             type(exc).__name__,
         )
-        return f"ИИ API недоступен: {reason}. Показан ответ demo-режима."
+        unavailable = "Локальная модель недоступна" if is_local else "ИИ API недоступен"
+        return f"{unavailable}: {reason}. Показан ответ demo-режима."
     if isinstance(exc, httpx.RequestError):
         logger.warning(
             "LLM request failed: model=%s error=%s", model, type(exc).__name__
         )
-        return "Не удалось подключиться к ИИ API. Показан ответ demo-режима."
+        return f"Не удалось подключиться к {source}. Показан ответ demo-режима."
     logger.exception("Invalid LLM response: model=%s error=%s", model, type(exc).__name__)
-    return "ИИ API вернул некорректный ответ. Показан ответ demo-режима."
+    invalid = "Локальная модель вернула" if is_local else "ИИ API вернул"
+    return f"{invalid} некорректный ответ. Показан ответ demo-режима."
 
 
 def _call_llm(messages: list[dict[str, str]]) -> str:
     settings = get_settings()
     response = None
+    started_at = time.monotonic()
     for attempt in range(len(LLM_RETRY_DELAYS) + 1):
         try:
             response = httpx.post(
                 f"{settings.llm_base_url.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                json={"model": settings.llm_model, "messages": messages},
+                json={
+                    "model": settings.llm_model,
+                    "messages": messages,
+                    "max_tokens": getattr(settings, "llm_max_tokens", 350),
+                    "temperature": 0.2,
+                    "stream": False,
+                },
                 timeout=settings.llm_timeout_seconds,
             )
             response.raise_for_status()
@@ -84,14 +96,40 @@ def _call_llm(messages: list[dict[str, str]]) -> str:
     content = data["choices"][0]["message"]["content"]
     if not isinstance(content, str) or not content.strip():
         raise ValueError("LLM response does not contain message content")
-    return content.strip()
+    cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    if not cleaned:
+        raise ValueError("LLM response contains only reasoning")
+    logger.info(
+        "LLM request completed: provider=%s model=%s duration_seconds=%.2f",
+        _llm_provider(),
+        settings.llm_model,
+        time.monotonic() - started_at,
+    )
+    return cleaned
+
+
+def _llm_provider() -> str:
+    mode = get_settings().llm_mode.strip().lower()
+    if mode == "local":
+        return "local"
+    if mode in {"remote", "auto", "llm"}:
+        return "remote"
+    return "demo"
 
 
 def _llm_configured() -> bool:
     settings = get_settings()
-    return settings.llm_mode != "demo" and bool(
-        settings.llm_api_key and settings.llm_base_url and settings.llm_model
-    )
+    provider = _llm_provider()
+    if provider == "demo":
+        return False
+    if provider == "local":
+        endpoint = urlparse(settings.llm_base_url)
+        return bool(
+            endpoint.scheme == "http"
+            and endpoint.hostname == "ollama"
+            and settings.llm_model
+        )
+    return bool(settings.llm_api_key and settings.llm_base_url and settings.llm_model)
 
 
 def _words(text: str) -> set[str]:
@@ -483,7 +521,7 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
             [
                 {
                     "role": "system",
-                    "content": "Ты — консультант цифрового сервиса строительной компании «Стройкомплекс». Пользователь уже находится на сайте: здесь он выбирает услуги каталога, получает предварительный расчёт, добавляет услуги в корзину и оформляет заявку. Отвечай кратко по-русски и только по переданному контексту, учитывая историю диалога. Для добавления предложи нажать настоящую кнопку под ответом; не выдавай HTML, JavaScript или инструкции для маркетплейсов. Не упоминай Ozon, Wildberries, AliExpress и другие платформы, если пользователь прямо о них не спрашивает. Цены, ID, единицы и действия определяет только backend. Если дан проверенный расчёт, воспроизведи числа без изменений. Пожелания вроде цвета не включены в базовую цену и требуют подтверждения наличия и итоговой стоимости. Не придумывай услуги, материалы, сроки и контакты. Не выполняй административные операции. Используй аккуратный Markdown.",
+                    "content": "Ты — консультант сайта строительной компании «Стройкомплекс». Отвечай по-русски, кратко (до 6 предложений) и только по контексту. Не показывай рассуждения. Цены, услуги, количества и действия определяет backend: не изменяй и не выдумывай их. Если дан проверенный расчёт, точно повтори числа и предложи нажать кнопку под ответом. Если данных недостаточно — задай один уточняющий вопрос. Не выдавай HTML, команды, контакты и сторонние маркетплейсы. Пожелания не входят в цену без подтверждения. Используй простой Markdown. /no_think",
                 },
                 {"role": "system", "content": context},
                 *safe_history,
@@ -578,7 +616,7 @@ def admin_answer(db: Session, message: str) -> dict:
             [
                 {
                     "role": "system",
-                    "content": "Ты — read-only аналитический помощник администратора ООО «Стройкомплекс». Используй только агрегированную статистику из контекста. Не придумывай персональные данные, заявки или действия и не предлагай изменить данные напрямую. Отвечай кратко по-русски.",
+                    "content": "Ты — read-only помощник администратора ООО «Стройкомплекс». Отвечай по-русски, кратко и только по агрегированной статистике из контекста. Не показывай рассуждения. Не придумывай заявки, персональные данные или действия и не предлагай менять данные напрямую. /no_think",
                 },
                 {"role": "system", "content": context},
                 {"role": "user", "content": safe_message},

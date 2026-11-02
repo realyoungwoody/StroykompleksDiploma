@@ -204,6 +204,60 @@ def llm_settings():
     )
 
 
+def test_local_mode_only_accepts_internal_ollama(monkeypatch):
+    settings = SimpleNamespace(
+        llm_mode="local",
+        llm_api_key="external-key-must-not-be-used",
+        llm_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        llm_model="gemini-model",
+        llm_timeout_seconds=5,
+    )
+    monkeypatch.setattr(assistant, "get_settings", lambda: settings)
+    post = monkeypatch.setattr(
+        assistant.httpx,
+        "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("LOCAL mode attempted an external request")
+        ),
+    )
+    with SessionLocal() as db:
+        result = assistant.client_answer(db, ChatIn(message="Какие есть услуги?"))
+    assert post is None
+    assert result["mode"] == "demo"
+    assert "warning" not in result
+
+
+def test_local_ollama_uses_openai_contract_without_real_key(monkeypatch):
+    settings = SimpleNamespace(
+        llm_mode="local",
+        llm_api_key="",
+        llm_base_url="http://ollama:11434/v1",
+        llm_model="qwen3:1.7b",
+        llm_timeout_seconds=120,
+        llm_max_tokens=111,
+    )
+    request_data = {}
+    monkeypatch.setattr(assistant, "get_settings", lambda: settings)
+
+    def post(url, **kwargs):
+        request_data.update(url=url, **kwargs)
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"choices": [{"message": {"content": "<think>скрыто</think>\nГотово"}}]},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    with SessionLocal() as db:
+        result = assistant.client_answer(db, ChatIn(message="Какие есть услуги?"))
+    assert result["mode"] == "llm"
+    assert result["answer"] == "Готово"
+    assert request_data["url"] == "http://ollama:11434/v1/chat/completions"
+    assert request_data["json"]["model"] == "qwen3:1.7b"
+    assert request_data["json"]["max_tokens"] == 111
+    assert request_data["json"]["stream"] is False
+
+
 def test_llm_success_is_visible(monkeypatch):
     monkeypatch.setattr(assistant, "get_settings", llm_settings)
 

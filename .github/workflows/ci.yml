@@ -105,7 +105,11 @@ jobs:
           EOF
 
       - name: Validate Compose configuration
-        run: docker compose -p stroykompleks-ci config --quiet
+        run: |
+          docker compose -p stroykompleks-ci config --quiet
+          LLM_MODEL=qwen3:1.7b docker compose -p stroykompleks-ci --profile local config --quiet
+          bash -n scripts/deploy_release.sh
+          sh -n scripts/init_ollama.sh scripts/check_local_llm.sh
 
       - name: Build images
         run: docker compose -p stroykompleks-ci build
