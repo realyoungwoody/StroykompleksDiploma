@@ -37,7 +37,13 @@ from .schemas import (
     TrackOut,
 )
 from .seed import FAQ, seed_database
-from .services.assistant import admin_answer, client_answer, order_statistics
+from .services.assistant import (
+    _llm_configured,
+    _llm_provider,
+    admin_answer,
+    client_answer,
+    order_statistics,
+)
 from .services.pricing import calculate_quote
 
 settings = get_settings()
@@ -130,9 +136,8 @@ def health(db: Session = Depends(get_db)):
         "status": "ok",
         "database": "connected",
         "ai_mode": settings.llm_mode,
-        "ai_configured": bool(
-            settings.llm_api_key and settings.llm_base_url and settings.llm_model
-        ),
+        "ai_provider": _llm_provider(),
+        "ai_configured": _llm_configured(),
         "ai_model": settings.llm_model or None,
     }
 

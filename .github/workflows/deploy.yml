@@ -25,7 +25,9 @@ jobs:
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The first LOCAL deployment may pull the pinned Ollama image and model.
+    # Subsequent releases reuse the persistent Docker volume and finish normally.
+    timeout-minutes: 60
     environment: production
     env:
       VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}

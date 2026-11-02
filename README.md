@@ -29,7 +29,7 @@
 ```text
 Browser → Nginx :8080 → React
                       └→ /api → FastAPI → SQLAlchemy → SQLite volume
-                                      └→ Retrieval/Tools → LLM API или Demo Assistant
+                                      └→ Retrieval/Tools → Ollama / внешний LLM / Demo
 ```
 
 Backend — единственный источник цен, статусов и расчётов. Историческая цена фиксируется в позициях заявки. ИИ изолирован от создания и изменения заявок.
@@ -44,9 +44,12 @@ cp .env.example .env
 
 В `.env` задайте безопасные `ADMIN_PASSWORD` и `SESSION_SECRET` (например, результат `python -c "import secrets; print(secrets.token_hex(32))"`). Для локального HTTP оставьте `COOKIE_SECURE=false`.
 
+Локальная LLM включена в `.env.example`. Первый запуск скачивает Qwen3 в отдельный
+persistent volume и может занять несколько минут:
+
 ```bash
-docker compose up --build -d
-docker compose logs -f
+docker compose --profile local up --build -d
+docker compose --profile local logs -f ollama ollama-init backend
 ```
 
 Адреса:
@@ -59,7 +62,7 @@ docker compose logs -f
 Остановка без удаления данных:
 
 ```bash
-docker compose down
+docker compose --profile local down
 ```
 
 Первый запуск автоматически применяет миграцию и идемпотентно добавляет демоданные. Учётные данные администратора берутся из локального `.env` и не выводятся в интерфейсе или документации.
@@ -70,21 +73,98 @@ docker compose down
 ./scripts/reset_demo_data.sh
 ```
 
-## ИИ-помощники
+## ИИ-помощники и локальная Qwen3
 
-По умолчанию `LLM_MODE=demo`: локальная логика ищет услуги и FAQ, извлекает количество из запроса и вызывает тот же серверный расчёт, что и корзина.
+Цены, услуги, количество, корзина и статусы всегда определяет FastAPI. LLM только
+формулирует короткое объяснение. FAQ, каталог и расчёты не требуют генеративной
+модели, поэтому отказ Ollama не останавливает сайт: пользователь получает
+детерминированный demo-ответ.
 
-Для OpenAI-compatible Chat Completions API задайте:
+### LOCAL — Ollama без внешних запросов
+
+Безопасная конфигурация для VPS с неизвестным объёмом памяти использует
+`qwen3:1.7b` (около 1,4 ГБ файлов модели). Для неё рекомендуется не менее 4 ГБ
+свободной RAM и 2 CPU; лимит контейнера по умолчанию — 4 ГБ и 4 CPU. Контекст
+ограничен 4096 токенами, параллелизм — одним запросом, ответ — 350 токенами.
 
 ```env
-LLM_MODE=auto
-LLM_API_KEY=...
+LLM_MODE=local
+LLM_BASE_URL=http://ollama:11434/v1
+LLM_API_KEY=ollama
+LLM_MODEL=qwen3:1.7b
+LLM_TIMEOUT_SECONDS=120
+LLM_MAX_TOKENS=350
+OLLAMA_CONTEXT_LENGTH=4096
+OLLAMA_KEEP_ALIVE=5m
+OLLAMA_MEMORY_LIMIT=4g
+OLLAMA_CPU_LIMIT=4.0
+```
+
+Запуск:
+
+```bash
+docker compose --profile local up --build -d
+docker compose --profile local ps
+./scripts/check_local_llm.sh
+```
+
+`ollama` доступна только во внутренней Docker-сети: порт 11434 не публикуется.
+`ollama-init` ждёт HTTP-сервис, проверяет модель, при необходимости выполняет
+`ollama pull`, затем делает тестовую генерацию. Модели сохраняются в volume
+`ollama_models`; обычные `down`, перезапуск и новый release их не удаляют.
+
+Для замены модели измените `LLM_MODEL`. `qwen3:4b` требует больше RAM, поэтому
+перед переключением проверьте сервер. Повторный запуск init-сервиса:
+
+```bash
+docker compose --profile local up ollama-init
+```
+
+### REMOTE и DEMO
+
+Внешний OpenAI-compatible провайдер используется только при явном режиме
+`remote` (старые `auto` и `llm` сохранены для совместимости):
+
+```env
+LLM_MODE=remote
+LLM_API_KEY=replace-with-provider-key
 LLM_BASE_URL=https://provider.example/v1
 LLM_MODEL=model-name
 LLM_TIMEOUT_SECONDS=25
 ```
 
-Режимы: `demo` — только локальная логика; `auto` — LLM при полной конфигурации, иначе demo; `llm` — попытка LLM с безопасным fallback. Внешнему провайдеру не передаются заявки и контакты, случайно введённые email и телефоны маскируются. Административный помощник получает только агрегаты и не выполняет изменения.
+Для полностью детерминированной работы без любой LLM:
+
+```env
+LLM_MODE=demo
+LLM_API_KEY=
+LLM_BASE_URL=
+LLM_MODEL=
+```
+
+В `local` backend принимает только внутренний адрес `http://ollama/...` и не
+может незаметно обратиться к Gemini. Внешние ключи не передаются в Ollama.
+
+### Диагностика и восстановление
+
+```bash
+docker compose --profile local ps
+docker compose --profile local logs --tail=200 ollama ollama-init backend
+docker compose --profile local exec ollama ollama list
+docker stats --no-stream
+./scripts/check_local_llm.sh
+```
+
+Публичный `/api/v1/health` показывает выбранный режим, тип провайдера и модель,
+но не URL и не ключ. Время завершившейся генерации записывается в backend-лог без
+текста запроса и секретов.
+
+Если первая загрузка оборвалась, не удаляйте volume: повторите запуск
+`ollama-init`, и Ollama продолжит/повторит загрузку. Для полного удаления модели
+нужно отдельное осознанное удаление volume; deploy и rollback этого не делают.
+Если памяти недостаточно, уменьшите `OLLAMA_CONTEXT_LENGTH`, оставьте
+`qwen3:1.7b` и проверьте `docker stats`. Не повышайте memory limit сверх реально
+доступной RAM VPS.
 
 ## Проверки
 

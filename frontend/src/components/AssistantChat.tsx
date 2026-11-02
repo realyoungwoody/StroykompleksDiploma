@@ -56,7 +56,7 @@ export function AssistantChat(){
       const actions=data.calculation_id&&data.cart_actions?.every(action=>action.calculation_id===data.calculation_id&&action.conversation_id===conversationId.current)?data.cart_actions:[]
       setMessages(current=>[...current,{role:'assistant',content:data.answer,mode:data.mode,warning:data.warning,cart_actions:actions,calculation_id:data.calculation_id,navigate_to:data.navigate_to}])
       setActiveCalculation(data.calculation_id&&actions.length?{id:data.calculation_id,actions}:null)
-      if(data.warning)notify({type:'warning',title:'ИИ API недоступен',description:data.warning})
+      if(data.warning)notify({type:'warning',title:'ИИ временно недоступен',description:data.warning})
     }catch(error){
       if(controller.signal.aborted||version!==requestVersion.current)return
       const message=error instanceof Error?error.message:'Помощник временно недоступен'
