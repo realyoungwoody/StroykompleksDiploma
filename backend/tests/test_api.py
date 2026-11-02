@@ -6,7 +6,7 @@ import httpx
 from app.core.database import SessionLocal
 from app.core.security import normalize_phone
 from app.models import Order
-from app.schemas import ChatIn, ItemIn
+from app.schemas import ChatActionContext, ChatCartItem, ChatIn, ChatMessage, ItemIn
 from app.services import assistant
 from app.services.assistant import demo_client_answer
 from app.services.pricing import calculate_quote, money
@@ -103,6 +103,34 @@ def test_admin_protection_login_and_status_history(client, admin_client):
     after = updated.json()
     assert after["status"] == "in_progress" and after["admin_note"] == "Проверено"
     assert len(after["history"]) >= len(before["history"])
+
+
+def test_assistant_preference_reaches_order_and_admin(client, admin_client):
+    comment = (
+        "Пожелание по услуге «Монтаж натяжного потолка»: Цвет: красный — "
+        "наличие материала и окончательная стоимость требуют уточнения."
+    )
+    created = client.post(
+        "/api/v1/orders",
+        headers={"Idempotency-Key": "22222222-2222-4222-8222-222222222222"},
+        json={
+            "customer_name": "Тестовый клиент",
+            "phone": "+79000000003",
+            "comment": comment,
+            "consent_accepted": True,
+            "items": [{"service_id": 7, "quantity": "50"}],
+        },
+    )
+    assert created.status_code == 201
+    listing = admin_client.get(
+        "/api/v1/admin/orders",
+        params={"search": created.json()["public_number"]},
+    ).json()
+    order = admin_client.get(
+        f"/api/v1/admin/orders/{listing['items'][0]['id']}"
+    ).json()
+    assert order["comment"] == comment
+    assert Decimal(str(order["items"][0]["quantity"])) == Decimal("50.00")
 
 
 def test_unauthorized(client):
@@ -233,6 +261,70 @@ def test_assistant_never_creates_action_for_unknown_service():
     assert result["quote"] is None
 
 
+def test_assistant_preserves_preference_and_conversation_action():
+    with SessionLocal() as db:
+        first = assistant.demo_client_answer(
+            db,
+            ChatIn(message="Мне нужен натяжной потолок красного цвета 50 м²"),
+        )
+        action = first["cart_actions"][0]
+        assert action["quantity"] == Decimal("50.00")
+        assert "красный" in action["note"]
+        follow_up = assistant.demo_client_answer(
+            db,
+            ChatIn(
+                message="Как добавить в корзину?",
+                history=[
+                    ChatMessage(
+                        role="user",
+                        content="Мне нужен натяжной потолок красного цвета 50 м²",
+                    )
+                ],
+                context_actions=[
+                    ChatActionContext(
+                        service_id=action["service_id"],
+                        quantity=action["quantity"],
+                        unit=action["unit"],
+                        note=action["note"],
+                    )
+                ],
+            ),
+        )
+    assert follow_up["cart_actions"][0]["service_id"] == action["service_id"]
+    assert follow_up["cart_actions"][0]["quantity"] == Decimal("50.00")
+    assert "Стройкомплекса" in follow_up["answer"]
+
+
+def test_assistant_updates_context_quantity_and_knows_cart_state():
+    with SessionLocal() as db:
+        first = assistant.demo_client_answer(
+            db, ChatIn(message="Натяжной потолок 50 м²")
+        )
+        action = first["cart_actions"][0]
+        context = ChatActionContext(
+            service_id=action["service_id"],
+            quantity=action["quantity"],
+            unit=action["unit"],
+        )
+        cart = ChatCartItem(service_id=action["service_id"], quantity=Decimal("50"))
+        changed = assistant.demo_client_answer(
+            db,
+            ChatIn(
+                message="Измени площадь на 75 м²",
+                context_actions=[context],
+                cart=[cart],
+            ),
+        )
+        next_step = assistant.demo_client_answer(
+            db,
+            ChatIn(message="Что дальше?", context_actions=[context], cart=[cart]),
+        )
+    assert changed["cart_actions"][0]["action"] == "set_cart_quantity"
+    assert changed["cart_actions"][0]["quantity"] == Decimal("75.00")
+    assert next_step["navigate_to"] == "/cart"
+    assert "оформлению" in next_step["answer"]
+
+
 def test_llm_http_error_returns_demo_with_warning(monkeypatch):
     monkeypatch.setattr(assistant, "get_settings", llm_settings)
 
@@ -249,6 +341,30 @@ def test_llm_http_error_returns_demo_with_warning(monkeypatch):
     assert result["mode"] == "demo"
     assert "test-model" in result["warning"]
     assert "demo-режима" in result["warning"]
+
+
+def test_llm_receives_limited_sanitized_history(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+    captured = {}
+
+    def post(*_args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://provider.example/v1/chat/completions"),
+            json={"choices": [{"message": {"content": "Продолжаем расчёт"}}]},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    history = [
+        ChatMessage(role="user", content="Натяжной потолок 50 м²"),
+        ChatMessage(role="assistant", content="Расчёт готов, телефон +7 900 000-00-00"),
+    ]
+    with SessionLocal() as db:
+        assistant.client_answer(db, ChatIn(message="А если красный?", history=history))
+    messages = captured["messages"]
+    assert any(message["content"] == "Натяжной потолок 50 м²" for message in messages)
+    assert not any("+7 900" in message["content"] for message in messages)
 
 
 def test_admin_assistant_uses_llm_with_aggregate_context(monkeypatch):

@@ -122,6 +122,7 @@ def _calculated_cart_actions(db: Session, query: str) -> tuple[list[dict], dict 
     if not items:
         return [], None
     quote = calculate_quote(db, items)
+    note = _preference_note(query)
     actions = [
         {
             "action": "add_to_cart",
@@ -131,31 +132,155 @@ def _calculated_cart_actions(db: Session, query: str) -> tuple[list[dict], dict 
             "quantity": line.quantity,
             "unit_price_rub": line.unit_price_rub,
             "line_total_rub": line.line_total_rub,
+            "note": note,
         }
         for line in quote.items
     ]
     return actions, quote.model_dump(mode="json")
 
 
+def _preference_note(text: str) -> str | None:
+    colors = {
+        "красн": "красный",
+        "син": "синий",
+        "зел": "зелёный",
+        "бел": "белый",
+        "черн": "чёрный",
+        "чёрн": "чёрный",
+        "сер": "серый",
+        "беж": "бежевый",
+        "желт": "жёлтый",
+        "жёлт": "жёлтый",
+    }
+    lower = text.lower()
+    for root, color in colors.items():
+        if root in lower and ("цвет" in lower or "потол" in lower):
+            return (
+                f"Цвет: {color} — пожелание клиента; наличие материала и "
+                "окончательная стоимость требуют уточнения."
+            )
+    return None
+
+
+def _contextual_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | None]:
+    if not payload.context_actions:
+        return [], None
+    lower = payload.message.lower()
+    preference = _preference_note(payload.message)
+    quantity_match = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*(?:м2|м²|кв(?:\.?\s*м)?)", lower
+    )
+    relevant = quantity_match or preference or any(
+        term in lower
+        for term in (
+            "корзин",
+            "добав",
+            "заказ",
+            "оформ",
+            "измени",
+            "площад",
+            "квадрат",
+            "убери",
+            "удали",
+        )
+    )
+    if not relevant:
+        return [], None
+    if quantity_match and len(payload.context_actions) != 1:
+        return [], None
+    new_quantity = (
+        Decimal(quantity_match.group(1).replace(",", ".")) if quantity_match else None
+    )
+    items = [
+        ItemIn(
+            service_id=item.service_id,
+            quantity=new_quantity if new_quantity is not None else item.quantity,
+        )
+        for item in payload.context_actions
+    ]
+    quote = calculate_quote(db, items)
+    context_by_id = {item.service_id: item for item in payload.context_actions}
+    cart_ids = {item.service_id for item in payload.cart}
+    if any(term in lower for term in ("убери", "удали")):
+        action_type = "remove_from_cart"
+    elif any(term in lower for term in ("измени", "замени", "установи")):
+        action_type = "set_cart_quantity"
+    else:
+        action_type = "add_to_cart"
+    actions = []
+    for line in quote.items:
+        context = context_by_id[line.service_id]
+        if line.unit != context.unit:
+            continue
+        operation = action_type
+        if operation in ("remove_from_cart", "set_cart_quantity") and line.service_id not in cart_ids:
+            operation = "add_to_cart"
+        actions.append(
+            {
+                "action": operation,
+                "service_id": line.service_id,
+                "name": line.name,
+                "unit": line.unit,
+                "quantity": line.quantity,
+                "unit_price_rub": line.unit_price_rub,
+                "line_total_rub": line.line_total_rub,
+                "note": preference or context.note,
+            }
+        )
+    if not actions:
+        return [], None
+    return actions, quote.model_dump(mode="json")
+
+
 def _quote_markdown(actions: list[dict]) -> str:
     sections = []
     for action in actions:
-        sections.append(
-            "\n".join(
-                (
-                    f"### {action['name']}",
-                    f"- Объём: **{action['quantity']:g} {action['unit']}**",
-                    f"- Цена за {action['unit']}: {action['unit_price_rub']:,.2f} ₽",
-                    f"- Предварительная стоимость: **{action['line_total_rub']:,.2f} ₽**",
-                )
-            ).replace(",", " ")
-        )
+        lines = [
+            f"### {action['name']}",
+            f"- Объём: **{action['quantity']:g} {action['unit']}**",
+            f"- Цена за {action['unit']}: {action['unit_price_rub']:,.2f} ₽",
+            f"- Предварительная стоимость: **{action['line_total_rub']:,.2f} ₽**",
+        ]
+        if action.get("note"):
+            lines.append(f"- Пожелание: {action['note']}")
+        sections.append("\n".join(lines).replace(",", " "))
     return "\n\n".join(sections) + "\n\n> Стоимость предварительная и уточняется после осмотра."
 
 
 def demo_client_answer(db: Session, payload: ChatIn) -> dict:
     query = payload.message.strip()
     lower = query.lower()
+    if payload.cart and ("что дальше" in lower or "перейти к оформ" in lower):
+        return {
+            "answer": "Услуга уже находится в корзине. Перейдите в корзину, проверьте объём и пожелания, затем нажмите **«Перейти к оформлению»**.",
+            "mode": "demo",
+            "sources": [{"type": "process", "title": "Оформление заявки"}],
+            "suggestions": [],
+            "quote": None,
+            "cart_actions": [],
+            "navigate_to": "/cart",
+        }
+    if payload.cart and any(term in lower for term in ("покажи корзин", "что в корзин")):
+        quote = calculate_quote(
+            db,
+            [
+                ItemIn(service_id=item.service_id, quantity=item.quantity)
+                for item in payload.cart
+            ],
+        )
+        lines = "\n".join(
+            f"- **{line.name}** — {line.quantity:g} {line.unit}, {line.line_total_rub:,.2f} ₽"
+            for line in quote.items
+        ).replace(",", " ")
+        return {
+            "answer": f"### В корзине\n\n{lines}\n\n**Итого: {quote.estimated_total_rub:,.2f} ₽**".replace(",", " "),
+            "mode": "demo",
+            "sources": [{"type": "cart", "title": "Текущая корзина"}],
+            "suggestions": [],
+            "quote": quote.model_dump(mode="json"),
+            "cart_actions": [],
+            "navigate_to": "/cart",
+        }
     if any(term in lower for term in ("заявк", "оформ")):
         return {
             "answer": "Выберите услуги, задайте объём, проверьте расчёт в корзине и заполните форму. Регистрация не нужна.",
@@ -173,6 +298,23 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
             "suggestions": [],
             "quote": None,
             "cart_actions": [],
+        }
+    contextual_actions, contextual_quote = _contextual_cart_actions(db, payload)
+    if contextual_actions:
+        operation = contextual_actions[0]["action"]
+        if operation == "remove_from_cart":
+            answer = "Нашёл выбранную услугу в корзине. Подтвердите удаление кнопкой ниже."
+        elif operation == "set_cart_quantity":
+            answer = _quote_markdown(contextual_actions) + "\n\nПодтвердите изменение объёма кнопкой ниже."
+        else:
+            answer = _quote_markdown(contextual_actions) + "\n\nНажмите кнопку ниже — услуга будет добавлена в корзину «Стройкомплекса»."
+        return {
+            "answer": answer,
+            "mode": "demo",
+            "sources": [{"type": "conversation", "title": "Текущий расчёт"}],
+            "suggestions": [],
+            "quote": contextual_quote,
+            "cart_actions": contextual_actions,
         }
     matches = search_services(db, query)
     if matches:
@@ -220,6 +362,25 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
     if not _llm_configured():
         return demo_client_answer(db, payload)
     fallback = demo_client_answer(db, payload)
+    lower = payload.message.lower()
+    if fallback.get("navigate_to") or (
+        payload.context_actions
+        and any(
+            term in lower
+            for term in (
+                "корзин",
+                "что дальше",
+                "оформ",
+                "добав",
+                "измени",
+                "замени",
+                "установи",
+                "убери",
+                "удали",
+            )
+        )
+    ):
+        return fallback
     context = "\n".join(
         f"- {s.name}: {s.base_price_rub} ₽/{s.unit}. {s.short_description}"
         for s in search_services(db, payload.message)
@@ -227,22 +388,50 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
     if fallback.get("cart_actions"):
         context += "\n\nПроверенный сервером расчёт:\n" + "\n".join(
             f"- {item['name']}: {item['quantity']} {item['unit']} × "
-            f"{item['unit_price_rub']} ₽ = {item['line_total_rub']} ₽"
+            f"{item['unit_price_rub']} ₽ = {item['line_total_rub']} ₽; "
+            f"пожелание: {item.get('note') or 'нет'}"
             for item in fallback["cart_actions"]
+        )
+    if payload.cart:
+        services = {
+            service.id: service
+            for service in db.scalars(
+                select(Service).where(
+                    Service.id.in_([item.service_id for item in payload.cart]),
+                    Service.is_active.is_(True),
+                )
+            ).all()
+        }
+        context += "\n\nТекущая корзина пользователя:\n" + "\n".join(
+            f"- {services[item.service_id].name}: {item.quantity} {services[item.service_id].unit}"
+            for item in payload.cart
+            if item.service_id in services
         )
     safe_message = re.sub(
         r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
         "[персональные данные скрыты]",
         payload.message,
     )
+    safe_history = [
+        {
+            "role": message.role,
+            "content": re.sub(
+                r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
+                "[персональные данные скрыты]",
+                message.content,
+            ),
+        }
+        for message in payload.history[-6:]
+    ]
     try:
         fallback["answer"] = _call_llm(
             [
                 {
                     "role": "system",
-                    "content": "Ты — виртуальный консультант демонстрационного сервиса ООО «Стройкомплекс». Отвечай кратко по-русски и только по контексту, используя аккуратный Markdown. Если дан проверенный сервером расчёт, воспроизведи его без изменения чисел. Все цены предварительные. Не придумывай услуги, сроки и контакты. Не выполняй административные операции.",
+                    "content": "Ты — консультант цифрового сервиса строительной компании «Стройкомплекс». Пользователь уже находится на сайте: здесь он выбирает услуги каталога, получает предварительный расчёт, добавляет услуги в корзину и оформляет заявку. Отвечай кратко по-русски и только по переданному контексту, учитывая историю диалога. Для добавления предложи нажать настоящую кнопку под ответом; не выдавай HTML, JavaScript или инструкции для маркетплейсов. Не упоминай Ozon, Wildberries, AliExpress и другие платформы, если пользователь прямо о них не спрашивает. Цены, ID, единицы и действия определяет только backend. Если дан проверенный расчёт, воспроизведи числа без изменений. Пожелания вроде цвета не включены в базовую цену и требуют подтверждения наличия и итоговой стоимости. Не придумывай услуги, материалы, сроки и контакты. Не выполняй административные операции. Используй аккуратный Markdown.",
                 },
                 {"role": "system", "content": context},
+                *safe_history,
                 {"role": "user", "content": safe_message},
             ]
         )
