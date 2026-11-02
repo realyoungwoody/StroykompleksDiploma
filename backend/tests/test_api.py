@@ -1,8 +1,13 @@
 from decimal import Decimal
+from types import SimpleNamespace
+
+import httpx
+
 from app.core.database import SessionLocal
 from app.core.security import normalize_phone
 from app.models import Order
 from app.schemas import ChatIn, ItemIn
+from app.services import assistant
 from app.services.assistant import demo_client_answer
 from app.services.pricing import calculate_quote, money
 
@@ -159,3 +164,71 @@ def test_metrics_and_public_agent_privacy(client, admin_client):
     )
     assert answer.status_code == 200
     assert "+7000" not in answer.json()["answer"]
+
+
+def llm_settings():
+    return SimpleNamespace(
+        llm_mode="auto",
+        llm_api_key="test-key",
+        llm_base_url="https://provider.example/v1",
+        llm_model="test-model",
+        llm_timeout_seconds=5,
+    )
+
+
+def test_llm_success_is_visible(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+
+    def post(*_args, **_kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://provider.example/v1/chat/completions"),
+            json={"choices": [{"message": {"content": "Ответ внешнего ИИ"}}]},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    with SessionLocal() as db:
+        result = assistant.client_answer(db, ChatIn(message="Какие есть услуги?"))
+    assert result["mode"] == "llm"
+    assert result["answer"] == "Ответ внешнего ИИ"
+    assert "warning" not in result
+
+
+def test_llm_http_error_returns_demo_with_warning(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+
+    def post(*_args, **_kwargs):
+        return httpx.Response(
+            404,
+            request=httpx.Request("POST", "https://provider.example/v1/chat/completions"),
+            json={"error": {"message": "model not found"}},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    with SessionLocal() as db:
+        result = assistant.client_answer(db, ChatIn(message="Какие есть услуги?"))
+    assert result["mode"] == "demo"
+    assert "test-model" in result["warning"]
+    assert "demo-режима" in result["warning"]
+
+
+def test_admin_assistant_uses_llm_with_aggregate_context(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+    captured = {}
+
+    def post(*_args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://provider.example/v1/chat/completions"),
+            json={"choices": [{"message": {"content": "Агрегированная сводка"}}]},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    with SessionLocal() as db:
+        result = assistant.admin_answer(db, "Что улучшить?")
+    assert result["mode"] == "llm"
+    assert result["answer"] == "Агрегированная сводка"
+    context = captured["messages"][1]["content"]
+    assert "Всего заявок" in context
+    assert "+7000" not in context

@@ -1,6 +1,8 @@
 import logging
 import re
 from decimal import Decimal
+from typing import Any
+
 import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -11,6 +13,58 @@ from .pricing import calculate_quote
 from ..seed import FAQ
 
 logger = logging.getLogger(__name__)
+
+
+def _llm_warning(exc: Exception, model: str) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in (401, 403):
+            reason = "проверьте API-ключ и права доступа"
+        elif status == 404:
+            reason = f"модель {model} недоступна"
+        elif status == 429:
+            reason = "превышен лимит запросов"
+        elif status >= 500:
+            reason = "провайдер временно недоступен"
+        else:
+            reason = f"провайдер вернул HTTP {status}"
+        logger.warning(
+            "LLM request failed: status=%s model=%s error=%s",
+            status,
+            model,
+            type(exc).__name__,
+        )
+        return f"ИИ API недоступен: {reason}. Показан ответ demo-режима."
+    if isinstance(exc, httpx.RequestError):
+        logger.warning(
+            "LLM request failed: model=%s error=%s", model, type(exc).__name__
+        )
+        return "Не удалось подключиться к ИИ API. Показан ответ demo-режима."
+    logger.exception("Invalid LLM response: model=%s error=%s", model, type(exc).__name__)
+    return "ИИ API вернул некорректный ответ. Показан ответ demo-режима."
+
+
+def _call_llm(messages: list[dict[str, str]]) -> str:
+    settings = get_settings()
+    response = httpx.post(
+        f"{settings.llm_base_url.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+        json={"model": settings.llm_model, "messages": messages},
+        timeout=settings.llm_timeout_seconds,
+    )
+    response.raise_for_status()
+    data: dict[str, Any] = response.json()
+    content = data["choices"][0]["message"]["content"]
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("LLM response does not contain message content")
+    return content.strip()
+
+
+def _llm_configured() -> bool:
+    settings = get_settings()
+    return settings.llm_mode != "demo" and bool(
+        settings.llm_api_key and settings.llm_base_url and settings.llm_model
+    )
 
 
 def _words(text: str) -> set[str]:
@@ -111,9 +165,7 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
 
 def client_answer(db: Session, payload: ChatIn) -> dict:
     settings = get_settings()
-    if settings.llm_mode == "demo" or not (
-        settings.llm_api_key and settings.llm_base_url and settings.llm_model
-    ):
+    if not _llm_configured():
         return demo_client_answer(db, payload)
     fallback = demo_client_answer(db, payload)
     context = "\n".join(
@@ -126,28 +178,20 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
         payload.message,
     )
     try:
-        response = httpx.post(
-            f"{settings.llm_base_url.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-            json={
-                "model": settings.llm_model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Ты — виртуальный консультант демонстрационного сервиса ООО «Стройкомплекс». Отвечай кратко по-русски и только по контексту. Все цены предварительные. Не придумывай услуги, сроки и контакты. Не выполняй административные операции.",
-                    },
-                    {"role": "system", "content": context},
-                    {"role": "user", "content": safe_message},
-                ],
-            },
-            timeout=settings.llm_timeout_seconds,
+        fallback["answer"] = _call_llm(
+            [
+                {
+                    "role": "system",
+                    "content": "Ты — виртуальный консультант демонстрационного сервиса ООО «Стройкомплекс». Отвечай кратко по-русски и только по контексту. Все цены предварительные. Не придумывай услуги, сроки и контакты. Не выполняй административные операции.",
+                },
+                {"role": "system", "content": context},
+                {"role": "user", "content": safe_message},
+            ]
         )
-        response.raise_for_status()
-        fallback["answer"] = response.json()["choices"][0]["message"]["content"]
         fallback["mode"] = "llm"
         return fallback
     except Exception as exc:
-        logger.warning("LLM unavailable, using demo mode: %s", type(exc).__name__)
+        fallback["warning"] = _llm_warning(exc, settings.llm_model)
         return fallback
 
 
@@ -208,3 +252,38 @@ def demo_admin_answer(db: Session, message: str) -> dict:
             " Рекомендуется начать с заявок, ожидающих первичной обработки более суток."
         )
     return {"answer": answer, "mode": "demo", "statistics": stats}
+
+
+def admin_answer(db: Session, message: str) -> dict:
+    settings = get_settings()
+    fallback = demo_admin_answer(db, message)
+    if not _llm_configured():
+        return fallback
+    stats = fallback["statistics"]
+    safe_message = re.sub(
+        r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
+        "[персональные данные скрыты]",
+        message,
+    )
+    context = (
+        f"Всего заявок: {stats['total']}; по статусам: {stats['by_status']}; "
+        f"новых старше 24 часов: {stats['overdue_new']}; "
+        f"популярные услуги: {stats['popular_services']}; "
+        f"среднее время первичной обработки: {stats['average_first_processing_hours']} ч."
+    )
+    try:
+        fallback["answer"] = _call_llm(
+            [
+                {
+                    "role": "system",
+                    "content": "Ты — read-only аналитический помощник администратора ООО «Стройкомплекс». Используй только агрегированную статистику из контекста. Не придумывай персональные данные, заявки или действия и не предлагай изменить данные напрямую. Отвечай кратко по-русски.",
+                },
+                {"role": "system", "content": context},
+                {"role": "user", "content": safe_message},
+            ]
+        )
+        fallback["mode"] = "llm"
+        return fallback
+    except Exception as exc:
+        fallback["warning"] = _llm_warning(exc, settings.llm_model)
+        return fallback
