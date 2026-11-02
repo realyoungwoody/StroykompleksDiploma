@@ -24,5 +24,34 @@ describe('UI feedback',()=>{
   it('renders an accessible confirmation modal',()=>{render(<Modal title="Очистить корзину?" onClose={()=>{}}><p>Подтверждение</p></Modal>);expect(screen.getByRole('dialog',{name:'Очистить корзину?'})).toBeInTheDocument()})
   it('renders GFM markdown and blocks unsafe HTML and links',()=>{const{container}=render(<MarkdownMessage>{'# Заголовок\n\n**Жирный текст**\n\n- Один\n- Два\n\n[опасно](javascript:alert(1))\n\n<script>alert(2)</script>'}</MarkdownMessage>);expect(screen.getByRole('heading',{name:'Заголовок'})).toBeInTheDocument();expect(screen.getByText('Жирный текст').tagName).toBe('STRONG');expect(screen.getAllByRole('listitem')).toHaveLength(2);expect(screen.getByText('опасно').closest('a')).toBeNull();expect(container.querySelector('script')).toBeNull()})
   it('adds multiple cart entries atomically, merges duplicates and persists them',async()=>{render(<MemoryRouter><CartProvider><CartHarness/></CartProvider></MemoryRouter>);fireEvent.click(screen.getByText('add'));fireEvent.click(screen.getByText('many-cart'));expect(screen.getByTestId('cart-quantity')).toHaveTextContent('5');expect(screen.getByTestId('cart-count')).toHaveTextContent('2');await waitFor(()=>expect(JSON.parse(localStorage.getItem('sk-cart')||'[]')).toHaveLength(2))})
-  it('adds the server-verified assistant quantity to the existing cart',async()=>{vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request)=>{const url=String(input);if(url.endsWith('/assistant/chat'))return new Response(JSON.stringify({answer:'### Укладка плитки\n\n**Расчёт готов**',mode:'demo',cart_actions:[{action:'add_to_cart',service_id:1,name:service.name,unit:'м²',quantity:'24.00',unit_price_rub:'100.00',line_total_rub:'2400.00'}]}),{status:200,headers:{'Content-Type':'application/json'}});if(url.endsWith('/services'))return new Response(JSON.stringify([service]),{status:200,headers:{'Content-Type':'application/json'}});return new Response('{}',{status:404})}));render(<MemoryRouter><ToastProvider><CartProvider><AssistantChat/><CartHarness/></CartProvider></ToastProvider></MemoryRouter>);fireEvent.click(screen.getByRole('button',{name:'Открыть ИИ-помощника'}));fireEvent.change(screen.getByLabelText('Сообщение помощнику'),{target:{value:'Рассчитай 24 м²'}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));expect(await screen.findByRole('heading',{name:'Укладка плитки'})).toBeInTheDocument();fireEvent.click(screen.getByRole('button',{name:/Добавить — 24.00 м²/}));await waitFor(()=>expect(screen.getByTestId('cart-quantity')).toHaveTextContent('24'));expect(screen.getByRole('button',{name:/Добавлено/})).toBeDisabled();expect(screen.getByText('Перейти в корзину →')).toBeInTheDocument();vi.unstubAllGlobals()})
+  it('adds the server-verified assistant quantity to the existing cart',async()=>{vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request)=>{const url=String(input);if(url.endsWith('/assistant/chat'))return new Response(JSON.stringify({answer:'### Укладка плитки\n\n**Расчёт готов**',mode:'demo',cart_actions:[{action:'add_to_cart',service_id:1,name:service.name,unit:'м²',quantity:'24.00',unit_price_rub:'100.00',line_total_rub:'2400.00'}]}),{status:200,headers:{'Content-Type':'application/json'}});if(url.endsWith('/services'))return new Response(JSON.stringify([service]),{status:200,headers:{'Content-Type':'application/json'}});return new Response('{}',{status:404})}));render(<MemoryRouter><ToastProvider><CartProvider><AssistantChat/><CartHarness/></CartProvider></ToastProvider></MemoryRouter>);fireEvent.click(screen.getByRole('button',{name:'Открыть ИИ-помощника'}));fireEvent.change(screen.getByLabelText('Сообщение помощнику'),{target:{value:'Рассчитай 24 м²'}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));expect(await screen.findByRole('heading',{name:'Укладка плитки'})).toBeInTheDocument();fireEvent.click(screen.getByRole('button',{name:/Добавить — 24.00 м²/}));await waitFor(()=>expect(screen.getByTestId('cart-quantity')).toHaveTextContent('24'));expect(screen.getByRole('button',{name:/Готово/})).toBeDisabled();expect(screen.getByText('Перейти в корзину →')).toBeInTheDocument();vi.unstubAllGlobals()})
+  it('sends the verified conversation context and cart preference on follow-up',async()=>{
+    const requests:Array<Record<string,unknown>>=[]
+    let assistantCalls=0
+    vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
+      const url=String(input)
+      if(url.endsWith('/assistant/chat')){
+        requests.push(JSON.parse(String(init?.body)))
+        assistantCalls+=1
+        const data=assistantCalls===1?{answer:'Расчёт потолка',mode:'demo',cart_actions:[{action:'add_to_cart',service_id:1,name:service.name,unit:'м²',quantity:'50.00',unit_price_rub:'100.00',line_total_rub:'5000.00',note:'Цвет: красный — пожелание клиента'}]}:{answer:'Перейдите к оформлению',mode:'demo',cart_actions:[],navigate_to:'/cart'}
+        return new Response(JSON.stringify(data),{status:200,headers:{'Content-Type':'application/json'}})
+      }
+      if(url.endsWith('/services'))return new Response(JSON.stringify([service]),{status:200,headers:{'Content-Type':'application/json'}})
+      return new Response('{}',{status:404})
+    }))
+    render(<MemoryRouter><ToastProvider><CartProvider><AssistantChat/><CartHarness/></CartProvider></ToastProvider></MemoryRouter>)
+    fireEvent.click(screen.getByRole('button',{name:'Открыть ИИ-помощника'}))
+    const input=screen.getByLabelText('Сообщение помощнику')
+    fireEvent.change(input,{target:{value:'Натяжной потолок красного цвета 50 м²'}})
+    fireEvent.click(screen.getByRole('button',{name:'Отправить'}))
+    fireEvent.click(await screen.findByRole('button',{name:/Добавить — 50.00 м²/}))
+    await waitFor(()=>expect(screen.getByTestId('cart-quantity')).toHaveTextContent('50'))
+    fireEvent.change(input,{target:{value:'Что дальше?'}})
+    fireEvent.click(screen.getByRole('button',{name:'Отправить'}))
+    await waitFor(()=>expect(requests).toHaveLength(2))
+    expect(requests[1].context_actions).toEqual([expect.objectContaining({service_id:1,quantity:'50.00',note:expect.stringContaining('красный')})])
+    expect(requests[1].cart).toEqual([expect.objectContaining({service_id:1,quantity:50,note:expect.stringContaining('красный')})])
+    expect(await screen.findByText('Перейдите к оформлению')).toBeInTheDocument()
+    vi.unstubAllGlobals()
+  })
 })
