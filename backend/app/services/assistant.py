@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import re
 from decimal import Decimal
@@ -87,7 +89,7 @@ def search_services(db: Session, query: str) -> list[Service]:
         score = sum(1 for word in words if word in text) + sum(
             3 for root in roots if root in text
         )
-        if score:
+        if score >= 2:
             ranked.append((score, service))
     return [
         service
@@ -95,6 +97,60 @@ def search_services(db: Session, query: str) -> list[Service]:
             :5
         ]
     ]
+
+
+def _calculated_cart_actions(db: Session, query: str) -> tuple[list[dict], dict | None]:
+    """Build cart actions only from catalog services and server-side pricing."""
+    segments = [
+        part.strip()
+        for part in re.split(r"\s+(?:и|а также)\s+|;", query, flags=re.IGNORECASE)
+        if part.strip()
+    ]
+    items: list[ItemIn] = []
+    seen: set[int] = set()
+    for segment in segments:
+        number = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:м2|м²|кв(?:\.?\s*м)?)", segment.lower())
+        matches = search_services(db, segment)
+        if not number or not matches:
+            continue
+        quantity = Decimal(number.group(1).replace(",", "."))
+        service = matches[0]
+        if service.id in seen or not Decimal("0.1") <= quantity <= Decimal("10000"):
+            continue
+        items.append(ItemIn(service_id=service.id, quantity=quantity))
+        seen.add(service.id)
+    if not items:
+        return [], None
+    quote = calculate_quote(db, items)
+    actions = [
+        {
+            "action": "add_to_cart",
+            "service_id": line.service_id,
+            "name": line.name,
+            "unit": line.unit,
+            "quantity": line.quantity,
+            "unit_price_rub": line.unit_price_rub,
+            "line_total_rub": line.line_total_rub,
+        }
+        for line in quote.items
+    ]
+    return actions, quote.model_dump(mode="json")
+
+
+def _quote_markdown(actions: list[dict]) -> str:
+    sections = []
+    for action in actions:
+        sections.append(
+            "\n".join(
+                (
+                    f"### {action['name']}",
+                    f"- Объём: **{action['quantity']:g} {action['unit']}**",
+                    f"- Цена за {action['unit']}: {action['unit_price_rub']:,.2f} ₽",
+                    f"- Предварительная стоимость: **{action['line_total_rub']:,.2f} ₽**",
+                )
+            ).replace(",", " ")
+        )
+    return "\n\n".join(sections) + "\n\n> Стоимость предварительная и уточняется после осмотра."
 
 
 def demo_client_answer(db: Session, payload: ChatIn) -> dict:
@@ -107,6 +163,7 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
             "sources": [{"type": "process", "title": "Порядок оформления"}],
             "suggestions": [],
             "quote": None,
+            "cart_actions": [],
         }
     if any(term in lower for term in ("статус", "провер")):
         return {
@@ -115,35 +172,28 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
             "sources": [{"type": "faq", "title": "Проверка статуса"}],
             "suggestions": [],
             "quote": None,
+            "cart_actions": [],
         }
     matches = search_services(db, query)
     if matches:
         service = matches[0]
-        number = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:м2|м²|кв)", lower)
-        quote = None
-        quote_text = ""
-        if number:
-            quantity = Decimal(number.group(1).replace(",", "."))
-            if Decimal("0.1") <= quantity <= Decimal("10000"):
-                calculation = calculate_quote(
-                    db, [ItemIn(service_id=service.id, quantity=quantity)]
-                )
-                quote = calculation.model_dump(mode="json")
-                quote_text = f" Для {quantity:g} {service.unit} ориентировочная стоимость — {calculation.estimated_total_rub:,.2f} ₽.".replace(
-                    ",", " "
-                )
-        answer = f"Подойдёт услуга «{service.name}»: {service.short_description} Цена — от {service.base_price_rub:,.0f} ₽/{service.unit}.{quote_text}".replace(
-            ",", " "
+        cart_actions, quote = _calculated_cart_actions(db, query)
+        answer = (
+            _quote_markdown(cart_actions)
+            if cart_actions
+            else (
+                f"### {service.name}\n\n{service.short_description}\n\n"
+                f"Цена — **от {service.base_price_rub:,.0f} ₽/{service.unit}**. "
+                f"Укажите объём в {service.unit}, чтобы получить расчёт и добавить услугу в корзину."
+            ).replace(",", " ")
         )
         return {
             "answer": answer,
             "mode": "demo",
             "sources": [{"type": "service", "id": service.id, "title": service.name}],
-            "suggestions": [
-                {"service_id": s.id, "label": f"Добавить: {s.name}"}
-                for s in matches[:3]
-            ],
+            "suggestions": [],
             "quote": quote,
+            "cart_actions": cart_actions,
         }
     for question, answer in FAQ:
         if len(_words(query) & _words(question)) >= 2:
@@ -153,6 +203,7 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
                 "sources": [{"type": "faq", "title": question}],
                 "suggestions": [],
                 "quote": None,
+                "cart_actions": [],
             }
     return {
         "answer": "Я могу подобрать услугу, объяснить порядок оформления или рассчитать предварительную стоимость. Например: «Сколько стоит 20 м² механизированной штукатурки?»",
@@ -160,6 +211,7 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
         "sources": [],
         "suggestions": [],
         "quote": None,
+        "cart_actions": [],
     }
 
 
@@ -172,6 +224,12 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
         f"- {s.name}: {s.base_price_rub} ₽/{s.unit}. {s.short_description}"
         for s in search_services(db, payload.message)
     )
+    if fallback.get("cart_actions"):
+        context += "\n\nПроверенный сервером расчёт:\n" + "\n".join(
+            f"- {item['name']}: {item['quantity']} {item['unit']} × "
+            f"{item['unit_price_rub']} ₽ = {item['line_total_rub']} ₽"
+            for item in fallback["cart_actions"]
+        )
     safe_message = re.sub(
         r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
         "[персональные данные скрыты]",
@@ -182,7 +240,7 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
             [
                 {
                     "role": "system",
-                    "content": "Ты — виртуальный консультант демонстрационного сервиса ООО «Стройкомплекс». Отвечай кратко по-русски и только по контексту. Все цены предварительные. Не придумывай услуги, сроки и контакты. Не выполняй административные операции.",
+                    "content": "Ты — виртуальный консультант демонстрационного сервиса ООО «Стройкомплекс». Отвечай кратко по-русски и только по контексту, используя аккуратный Markdown. Если дан проверенный сервером расчёт, воспроизведи его без изменения чисел. Все цены предварительные. Не придумывай услуги, сроки и контакты. Не выполняй административные операции.",
                 },
                 {"role": "system", "content": context},
                 {"role": "user", "content": safe_message},
