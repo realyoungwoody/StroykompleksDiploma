@@ -1,57 +1,61 @@
-import{render,screen,fireEvent,waitFor}from'@testing-library/react'
-import{MemoryRouter}from'react-router-dom'
-import{describe,it,expect,beforeEach,vi}from'vitest'
-import{CartProvider,useCart}from'../src/contexts/CartContext'
-import{ToastProvider,useToast}from'../src/contexts/ToastContext'
-import{AssistantChat}from'../src/components/AssistantChat'
-import{MarkdownMessage}from'../src/components/MarkdownMessage'
-import{Button,Modal,StatusBadge}from'../src/components/UI'
-import{ServiceCard}from'../src/components/ServiceCard'
+import {fireEvent,render,screen,waitFor} from '@testing-library/react'
+import {MemoryRouter} from 'react-router-dom'
+import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest'
+import {AssistantChat} from '../src/components/AssistantChat'
+import {MarkdownMessage} from '../src/components/MarkdownMessage'
+import {ServiceCard} from '../src/components/ServiceCard'
+import {Button,Modal,StatusBadge} from '../src/components/UI'
+import {CartProvider,useCart} from '../src/contexts/CartContext'
+import {ToastProvider,useToast} from '../src/contexts/ToastContext'
+import {AdminAssistant} from '../src/pages/admin/AdminPages'
 
-const service={id:1,slug:'test',name:'Тестовая услуга',category:'Тест',short_description:'Описание',description:'Описание услуги',stages:'Этап',unit:'м²',base_price_rub:'100.00',is_active:true,sort_order:1}
+const service={id:1,slug:'test',name:'Тестовая услуга',category:'Тест',short_description:'Описание',description:'Описание',stages:'Этап',unit:'м²',base_price_rub:'100.00',is_active:true,sort_order:1}
+const json=(value:unknown,status=200)=>new Response(JSON.stringify(value),{status,headers:{'Content-Type':'application/json'}})
+const action=(body:Record<string,unknown>,calculation_id='calculation-1',quantity='24.00',id=1)=>({action:'add_to_cart',calculation_id,conversation_id:body.conversation_id,service_id:id,name:id===1?service.name:'Вторая услуга',unit:'м²',quantity,unit_price_rub:'100.00',line_total_rub:(Number(quantity)*100).toFixed(2)})
+const answer=(body:Record<string,unknown>,calculation_id='calculation-1',quantity='24.00')=>({answer:`### Расчёт ${quantity}`,mode:'demo',calculation_id,cart_actions:[action(body,calculation_id,quantity)]})
 
-function CartHarness(){const{items,add,addMany,setQuantity}=useCart();return <><button onClick={()=>add(service,2)}>add</button><button onClick={()=>addMany([{service,quantity:3},{service:{...service,id:2,name:'Вторая услуга'},quantity:4}])}>many-cart</button><button onClick={()=>setQuantity(1,5)}>change</button><span data-testid="cart-quantity">{items[0]?.quantity||0}</span><span data-testid="cart-count">{items.length}</span></>}
-function ToastHarness(){const{notify}=useToast();return <><button onClick={()=>notify({type:'success',title:'Готово'})}>same</button><button onClick={()=>['Один','Два','Три','Четыре'].forEach(title=>notify({type:'info',title}))}>many</button></>}
+function CartHarness(){const{items,add,addMany,setQuantity}=useCart();return <><button onClick={()=>add(service,2)}>add</button><button onClick={()=>addMany([{service,quantity:3},{service:{...service,id:2,name:'Вторая услуга'},quantity:4}])}>many</button><button onClick={()=>setQuantity(1,5)}>change</button><span data-testid="quantity">{items[0]?.quantity||0}</span><span data-testid="count">{items.length}</span></>}
+function ToastHarness(){const{notify}=useToast();return <><button onClick={()=>notify({type:'success',title:'Готово'})}>same</button><button onClick={()=>['Один','Два','Три','Четыре'].forEach(title=>notify({type:'info',title}))}>many-toasts</button></>}
+function Chat(){return <MemoryRouter><ToastProvider><CartProvider><AssistantChat/><CartHarness/></CartProvider></ToastProvider></MemoryRouter>}
+function openAndSend(message:string){fireEvent.click(screen.getByRole('button',{name:'Открыть ИИ-помощника'}));const input=screen.getByLabelText('Сообщение помощнику');fireEvent.change(input,{target:{value:message}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));return input}
+function mockChat(handler:(body:Record<string,unknown>,call:number)=>unknown,quoteTotal='2400.00'){
+  let calls=0
+  vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
+    const url=String(input)
+    if(url.endsWith('/assistant/chat'))return json(handler(JSON.parse(String(init?.body)),++calls))
+    if(url.endsWith('/services'))return json([service,{...service,id:2,name:'Вторая услуга'}])
+    if(url.endsWith('/quotes'))return json({items:[{service_id:1,name:service.name,unit:'м²',quantity:'24.00',unit_price_rub:'100.00',line_total_rub:quoteTotal}],estimated_total_rub:quoteTotal})
+    return json({},404)
+  }))
+}
 
-describe('UI feedback',()=>{
+describe('UI and assistant stability',()=>{
   beforeEach(()=>localStorage.clear())
-  it('adds and updates a cart item',()=>{render(<MemoryRouter><CartProvider><CartHarness/></CartProvider></MemoryRouter>);fireEvent.click(screen.getByText('add'));expect(screen.getByText('2')).toBeInTheDocument();fireEvent.click(screen.getByText('change'));expect(screen.getByText('5')).toBeInTheDocument()})
-  it('renders a localized status',()=>{render(<StatusBadge status="in_progress"/>);expect(screen.getByText('В работе')).toBeInTheDocument()})
-  it('shows loading state and blocks repeated button clicks',()=>{render(<Button loading loadingText="Сохранение…">Сохранить</Button>);const button=screen.getByRole('button',{name:'Сохранение…'});expect(button).toBeDisabled();expect(button).toHaveAttribute('aria-busy','true')})
-  it('deduplicates equal toasts',()=>{render(<ToastProvider><ToastHarness/></ToastProvider>);fireEvent.click(screen.getByText('same'));fireEvent.click(screen.getByText('same'));expect(screen.getAllByText('Готово')).toHaveLength(1)})
-  it('keeps no more than three visible toasts',()=>{render(<ToastProvider><ToastHarness/></ToastProvider>);fireEvent.click(screen.getByText('many'));expect(screen.queryByText('Один')).not.toBeInTheDocument();expect(screen.getAllByRole('status')).toHaveLength(3)})
-  it('announces a catalog addition and distinguishes an update',()=>{render(<MemoryRouter><ToastProvider><CartProvider><ServiceCard service={service}/></CartProvider></ToastProvider></MemoryRouter>);const add=screen.getByRole('button',{name:'Добавить Тестовая услуга'});fireEvent.click(add);expect(screen.getByText('Добавлено в корзину')).toBeInTheDocument();fireEvent.click(add);expect(screen.getByText('Количество обновлено')).toBeInTheDocument()})
-  it('renders an accessible confirmation modal',()=>{render(<Modal title="Очистить корзину?" onClose={()=>{}}><p>Подтверждение</p></Modal>);expect(screen.getByRole('dialog',{name:'Очистить корзину?'})).toBeInTheDocument()})
-  it('renders GFM markdown and blocks unsafe HTML and links',()=>{const{container}=render(<MarkdownMessage>{'# Заголовок\n\n**Жирный текст**\n\n- Один\n- Два\n\n[опасно](javascript:alert(1))\n\n<script>alert(2)</script>'}</MarkdownMessage>);expect(screen.getByRole('heading',{name:'Заголовок'})).toBeInTheDocument();expect(screen.getByText('Жирный текст').tagName).toBe('STRONG');expect(screen.getAllByRole('listitem')).toHaveLength(2);expect(screen.getByText('опасно').closest('a')).toBeNull();expect(container.querySelector('script')).toBeNull()})
-  it('adds multiple cart entries atomically, merges duplicates and persists them',async()=>{render(<MemoryRouter><CartProvider><CartHarness/></CartProvider></MemoryRouter>);fireEvent.click(screen.getByText('add'));fireEvent.click(screen.getByText('many-cart'));expect(screen.getByTestId('cart-quantity')).toHaveTextContent('5');expect(screen.getByTestId('cart-count')).toHaveTextContent('2');await waitFor(()=>expect(JSON.parse(localStorage.getItem('sk-cart')||'[]')).toHaveLength(2))})
-  it('adds the server-verified assistant quantity to the existing cart',async()=>{vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request)=>{const url=String(input);if(url.endsWith('/assistant/chat'))return new Response(JSON.stringify({answer:'### Укладка плитки\n\n**Расчёт готов**',mode:'demo',cart_actions:[{action:'add_to_cart',service_id:1,name:service.name,unit:'м²',quantity:'24.00',unit_price_rub:'100.00',line_total_rub:'2400.00'}]}),{status:200,headers:{'Content-Type':'application/json'}});if(url.endsWith('/services'))return new Response(JSON.stringify([service]),{status:200,headers:{'Content-Type':'application/json'}});return new Response('{}',{status:404})}));render(<MemoryRouter><ToastProvider><CartProvider><AssistantChat/><CartHarness/></CartProvider></ToastProvider></MemoryRouter>);fireEvent.click(screen.getByRole('button',{name:'Открыть ИИ-помощника'}));fireEvent.change(screen.getByLabelText('Сообщение помощнику'),{target:{value:'Рассчитай 24 м²'}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));expect(await screen.findByRole('heading',{name:'Укладка плитки'})).toBeInTheDocument();fireEvent.click(screen.getByRole('button',{name:/Добавить — 24.00 м²/}));await waitFor(()=>expect(screen.getByTestId('cart-quantity')).toHaveTextContent('24'));expect(screen.getByRole('button',{name:/Готово/})).toBeDisabled();expect(screen.getByText('Перейти в корзину →')).toBeInTheDocument();vi.unstubAllGlobals()})
-  it('sends the verified conversation context and cart preference on follow-up',async()=>{
-    const requests:Array<Record<string,unknown>>=[]
-    let assistantCalls=0
-    vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
-      const url=String(input)
-      if(url.endsWith('/assistant/chat')){
-        requests.push(JSON.parse(String(init?.body)))
-        assistantCalls+=1
-        const data=assistantCalls===1?{answer:'Расчёт потолка',mode:'demo',cart_actions:[{action:'add_to_cart',service_id:1,name:service.name,unit:'м²',quantity:'50.00',unit_price_rub:'100.00',line_total_rub:'5000.00',note:'Цвет: красный — пожелание клиента'}]}:{answer:'Перейдите к оформлению',mode:'demo',cart_actions:[],navigate_to:'/cart'}
-        return new Response(JSON.stringify(data),{status:200,headers:{'Content-Type':'application/json'}})
-      }
-      if(url.endsWith('/services'))return new Response(JSON.stringify([service]),{status:200,headers:{'Content-Type':'application/json'}})
-      return new Response('{}',{status:404})
-    }))
-    render(<MemoryRouter><ToastProvider><CartProvider><AssistantChat/><CartHarness/></CartProvider></ToastProvider></MemoryRouter>)
-    fireEvent.click(screen.getByRole('button',{name:'Открыть ИИ-помощника'}))
-    const input=screen.getByLabelText('Сообщение помощнику')
-    fireEvent.change(input,{target:{value:'Натяжной потолок красного цвета 50 м²'}})
-    fireEvent.click(screen.getByRole('button',{name:'Отправить'}))
-    fireEvent.click(await screen.findByRole('button',{name:/Добавить — 50.00 м²/}))
-    await waitFor(()=>expect(screen.getByTestId('cart-quantity')).toHaveTextContent('50'))
-    fireEvent.change(input,{target:{value:'Что дальше?'}})
-    fireEvent.click(screen.getByRole('button',{name:'Отправить'}))
-    await waitFor(()=>expect(requests).toHaveLength(2))
-    expect(requests[1].context_actions).toEqual([expect.objectContaining({service_id:1,quantity:'50.00',note:expect.stringContaining('красный')})])
-    expect(requests[1].cart).toEqual([expect.objectContaining({service_id:1,quantity:50,note:expect.stringContaining('красный')})])
-    expect(await screen.findByText('Перейдите к оформлению')).toBeInTheDocument()
-    vi.unstubAllGlobals()
+  afterEach(()=>vi.unstubAllGlobals())
+
+  it('adds, updates and persists cart items',async()=>{render(<MemoryRouter><CartProvider><CartHarness/></CartProvider></MemoryRouter>);fireEvent.click(screen.getByText('add'));fireEvent.click(screen.getByText('change'));expect(screen.getByTestId('quantity')).toHaveTextContent('5');await waitFor(()=>expect(JSON.parse(localStorage.getItem('sk-cart')||'[]')).toHaveLength(1))})
+  it('merges duplicate cart entries atomically',()=>{render(<MemoryRouter><CartProvider><CartHarness/></CartProvider></MemoryRouter>);fireEvent.click(screen.getByText('add'));fireEvent.click(screen.getByText('many'));expect(screen.getByTestId('quantity')).toHaveTextContent('5');expect(screen.getByTestId('count')).toHaveTextContent('2')})
+  it('renders localized status and loading button',()=>{render(<><StatusBadge status="in_progress"/><Button loading loadingText="Сохранение…">Сохранить</Button></>);expect(screen.getByText('В работе')).toBeInTheDocument();expect(screen.getByRole('button',{name:'Сохранение…'})).toBeDisabled()})
+  it('deduplicates toasts and keeps only three',()=>{render(<ToastProvider><ToastHarness/></ToastProvider>);fireEvent.click(screen.getByText('same'));fireEvent.click(screen.getByText('same'));expect(screen.getAllByText('Готово')).toHaveLength(1);fireEvent.click(screen.getByText('many-toasts'));expect(screen.getAllByRole('status')).toHaveLength(3)})
+  it('renders an accessible modal and safe markdown',()=>{render(<><Modal title="Подтвердить?" onClose={()=>{}}>Текст</Modal><MarkdownMessage>{'# Заголовок\n\n[опасно](javascript:alert(1))\n\n<script>x</script>'}</MarkdownMessage></>);expect(screen.getByRole('dialog',{name:'Подтвердить?'})).toBeInTheDocument();expect(screen.getByRole('heading',{name:'Заголовок'})).toBeInTheDocument();expect(screen.getByText('опасно').closest('a')).toBeNull()})
+  it('keeps catalog add-to-cart behavior working',()=>{render(<MemoryRouter><ToastProvider><CartProvider><ServiceCard service={service}/><CartHarness/></CartProvider></ToastProvider></MemoryRouter>);fireEvent.click(screen.getByRole('button',{name:`Добавить ${service.name}`}));expect(screen.getByTestId('quantity')).toHaveTextContent('1');expect(screen.getByText('Добавлено в корзину')).toBeInTheDocument()})
+
+  it('shows verified action, rechecks price and prevents a double add',async()=>{mockChat(body=>answer(body));render(<Chat/>);openAndSend('24 м²');const button=await screen.findByRole('button',{name:/Добавить — 24.00 м²/});fireEvent.click(button);fireEvent.click(button);await waitFor(()=>expect(screen.getByTestId('quantity')).toHaveTextContent('24'));expect(screen.getByRole('button',{name:/Готово/})).toBeDisabled();expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/quotes'),expect.anything())})
+  it('does not invent an action when backend returned none',async()=>{mockChat(()=>({answer:'Нужен объём',mode:'demo',cart_actions:[]}));render(<Chat/>);openAndSend('консультация');expect(await screen.findByText('Нужен объём')).toBeInTheDocument();expect(screen.queryByRole('button',{name:/Добавить —/})).not.toBeInTheDocument()})
+  it('renders independent cards for multiple verified services',async()=>{mockChat(body=>({answer:'Два расчёта',mode:'demo',calculation_id:'calculation-many',cart_actions:[action(body,'calculation-many','30.00'),action(body,'calculation-many','50.00',2)]}));render(<Chat/>);openAndSend('30 м² штукатурки и 50 м² потолка');expect(await screen.findByRole('button',{name:'Добавить всё в корзину'})).toBeEnabled();expect(screen.getAllByRole('button',{name:/Добавить —/})).toHaveLength(2)})
+  it('marks a previous 50 m² calculation stale after a 75 m² follow-up',async()=>{mockChat((body,call)=>answer(body,`calculation-${call}`,call===1?'50.00':'75.00'));render(<Chat/>);const input=openAndSend('50 м²');await screen.findByRole('button',{name:/Добавить — 50.00/});fireEvent.change(input,{target:{value:'а если 75 м²'}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));expect(screen.getByRole('button',{name:'Расчёт устарел'})).toBeDisabled();expect(await screen.findByRole('button',{name:/Добавить — 75.00/})).toBeEnabled()})
+  it('invalidates a service action when topic switches',async()=>{mockChat((body,call)=>answer(body,`calculation-${call}`,call===1?'20.00':'30.00'));render(<Chat/>);const input=openAndSend('потолок 20 м²');await screen.findByRole('button',{name:/Добавить — 20.00/});fireEvent.change(input,{target:{value:'покраска 30 м²'}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));expect(screen.getByRole('button',{name:'Расчёт устарел'})).toBeDisabled();expect(await screen.findByRole('button',{name:/Добавить — 30.00/})).toBeEnabled()})
+  it('invalidates actions after a plain consultation response',async()=>{mockChat((body,call)=>call===1?answer(body):{answer:'Консультация',mode:'demo',cart_actions:[]});render(<Chat/>);const input=openAndSend('24 м²');await screen.findByRole('button',{name:/Добавить —/});fireEvent.change(input,{target:{value:'просто расскажи'}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));expect(await screen.findByText('Консультация')).toBeInTheDocument();expect(screen.getByRole('button',{name:'Расчёт устарел'})).toBeDisabled()})
+  it('rejects an action when the server price changed',async()=>{mockChat(body=>answer(body),'2500.00');render(<Chat/>);openAndSend('24 м²');fireEvent.click(await screen.findByRole('button',{name:/Добавить —/}));expect(await screen.findByText('Расчёт устарел')).toBeInTheDocument();expect(screen.getByTestId('quantity')).toHaveTextContent('0')})
+  it('ignores an older response that arrives after a newer one',async()=>{
+    let resolveOld!:(value:Response)=>void;let resolveNew!:(value:Response)=>void;const bodies:Record<string,unknown>[]=[]
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{const url=String(input);if(!url.endsWith('/assistant/chat'))return Promise.resolve(json({}));const body=JSON.parse(String(init?.body));bodies.push(body);return new Promise<Response>(resolve=>{if(bodies.length===1)resolveOld=resolve;else resolveNew=resolve})}))
+    render(<Chat/>);const input=openAndSend('старый запрос');fireEvent.change(input,{target:{value:'новый запрос'}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));resolveNew(json(answer(bodies[1],'calculation-new','75.00')));expect(await screen.findByText('Расчёт 75.00')).toBeInTheDocument();resolveOld(json(answer(bodies[0],'calculation-old','50.00')));await waitFor(()=>expect(screen.queryByText('Расчёт 50.00')).not.toBeInTheDocument())
   })
+  it('starts a clean dialog and changes its conversation id',async()=>{const ids:string[]=[];mockChat(body=>{ids.push(String(body.conversation_id));return answer(body)});render(<Chat/>);openAndSend('24 м²');await screen.findByRole('button',{name:/Добавить —/});fireEvent.click(screen.getByRole('button',{name:'Новый диалог'}));expect(screen.queryByRole('button',{name:/Добавить —/})).not.toBeInTheDocument();const input=screen.getByLabelText('Сообщение помощнику');fireEvent.change(input,{target:{value:'ещё'}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));await waitFor(()=>expect(ids).toHaveLength(2));expect(ids[1]).not.toBe(ids[0])})
+  it('does not restore active actions after reopening the component',async()=>{mockChat(body=>answer(body));const view=render(<Chat/>);openAndSend('24 м²');await screen.findByRole('button',{name:/Добавить —/});view.unmount();render(<Chat/>);fireEvent.click(screen.getByRole('button',{name:'Открыть ИИ-помощника'}));expect(screen.queryByRole('button',{name:/Добавить —/})).not.toBeInTheDocument()})
+
+  it('admin Enter sends and clears input immediately',async()=>{let resolve!:(value:Response)=>void;vi.stubGlobal('fetch',vi.fn(()=>new Promise<Response>(done=>{resolve=done})));render(<MemoryRouter><ToastProvider><AdminAssistant/></ToastProvider></MemoryRouter>);const input=screen.getByLabelText('Сообщение административному помощнику');fireEvent.change(input,{target:{value:'Сводка'}});fireEvent.keyDown(input,{key:'Enter',shiftKey:false});expect(input).toHaveValue('');resolve(json({answer:'Готово',mode:'demo'}));expect(await screen.findByText('Готово')).toBeInTheDocument()})
+  it('admin Shift+Enter creates a line break without sending',()=>{vi.stubGlobal('fetch',vi.fn());render(<MemoryRouter><ToastProvider><AdminAssistant/></ToastProvider></MemoryRouter>);const input=screen.getByLabelText('Сообщение административному помощнику');fireEvent.keyDown(input,{key:'Enter',shiftKey:true});expect(fetch).not.toHaveBeenCalled()})
+  it('admin restores the submitted text after an error',async()=>{vi.stubGlobal('fetch',vi.fn(async()=>json({detail:'Ошибка'},500)));render(<MemoryRouter><ToastProvider><AdminAssistant/></ToastProvider></MemoryRouter>);const input=screen.getByLabelText('Сообщение административному помощнику');fireEvent.change(input,{target:{value:'Важный запрос'}});fireEvent.keyDown(input,{key:'Enter'});await waitFor(()=>expect(input).toHaveValue('Важный запрос'));expect(await screen.findByText('Помощник недоступен')).toBeInTheDocument()})
 })

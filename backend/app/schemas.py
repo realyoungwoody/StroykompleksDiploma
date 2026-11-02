@@ -155,6 +155,8 @@ class ChatMessage(BaseModel):
 
 
 class ChatActionContext(BaseModel):
+    calculation_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    conversation_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     service_id: int
     quantity: Decimal = Field(
         ge=Decimal("0.1"), le=Decimal("10000"), max_digits=12, decimal_places=2
@@ -173,6 +175,12 @@ class ChatCartItem(BaseModel):
 
 class ChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=1500)
+    conversation_id: str = Field(
+        default="legacy-chat", min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
+    )
+    context_calculation_id: str | None = Field(
+        default=None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
+    )
     history: list[ChatMessage] = Field(default_factory=list, max_length=6)
     context_actions: list[ChatActionContext] = Field(default_factory=list, max_length=20)
     cart: list[ChatCartItem] = Field(default_factory=list, max_length=20)

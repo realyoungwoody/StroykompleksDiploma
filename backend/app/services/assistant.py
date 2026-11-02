@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 import time
 from decimal import Decimal
 from typing import Any
@@ -189,6 +190,16 @@ def _preference_note(text: str) -> str | None:
 def _contextual_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | None]:
     if not payload.context_actions:
         return [], None
+    if not payload.context_calculation_id or any(
+        item.calculation_id != payload.context_calculation_id
+        or item.conversation_id != payload.conversation_id
+        for item in payload.context_actions
+    ):
+        logger.warning(
+            "Rejected stale assistant context: conversation_id=%s",
+            payload.conversation_id,
+        )
+        return [], None
     lower = payload.message.lower()
     preference = _preference_note(payload.message)
     quantity_match = re.search(
@@ -254,6 +265,16 @@ def _contextual_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], 
     if not actions:
         return [], None
     return actions, quote.model_dump(mode="json")
+
+
+def _version_actions(actions: list[dict], conversation_id: str) -> str | None:
+    if not actions:
+        return None
+    calculation_id = secrets.token_urlsafe(12)
+    for action in actions:
+        action["calculation_id"] = calculation_id
+        action["conversation_id"] = conversation_id
+    return calculation_id
 
 
 def _quote_markdown(actions: list[dict]) -> str:
@@ -323,8 +344,16 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
             "quote": None,
             "cart_actions": [],
         }
-    contextual_actions, contextual_quote = _contextual_cart_actions(db, payload)
+    # An explicitly named service starts a fresh calculation. Conversation
+    # context is only used for genuine follow-ups such as "а если 75 м²".
+    matches = search_services(db, query)
+    contextual_actions, contextual_quote = (
+        ([], None) if matches else _contextual_cart_actions(db, payload)
+    )
     if contextual_actions:
+        calculation_id = _version_actions(
+            contextual_actions, payload.conversation_id
+        )
         operation = contextual_actions[0]["action"]
         if operation == "remove_from_cart":
             answer = "Нашёл выбранную услугу в корзине. Подтвердите удаление кнопкой ниже."
@@ -339,11 +368,12 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
             "suggestions": [],
             "quote": contextual_quote,
             "cart_actions": contextual_actions,
+            "calculation_id": calculation_id,
         }
-    matches = search_services(db, query)
     if matches:
         service = matches[0]
         cart_actions, quote = _calculated_cart_actions(db, query)
+        calculation_id = _version_actions(cart_actions, payload.conversation_id)
         answer = (
             _quote_markdown(cart_actions)
             if cart_actions
@@ -360,6 +390,7 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
             "suggestions": [],
             "quote": quote,
             "cart_actions": cart_actions,
+            "calculation_id": calculation_id,
         }
     for question, answer in FAQ:
         if len(_words(query) & _words(question)) >= 2:
