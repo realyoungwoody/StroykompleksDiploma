@@ -1,14 +1,16 @@
-import{render,screen,fireEvent}from'@testing-library/react'
+import{render,screen,fireEvent,waitFor}from'@testing-library/react'
 import{MemoryRouter}from'react-router-dom'
-import{describe,it,expect,beforeEach}from'vitest'
+import{describe,it,expect,beforeEach,vi}from'vitest'
 import{CartProvider,useCart}from'../src/contexts/CartContext'
 import{ToastProvider,useToast}from'../src/contexts/ToastContext'
+import{AssistantChat}from'../src/components/AssistantChat'
+import{MarkdownMessage}from'../src/components/MarkdownMessage'
 import{Button,Modal,StatusBadge}from'../src/components/UI'
 import{ServiceCard}from'../src/components/ServiceCard'
 
 const service={id:1,slug:'test',name:'Тестовая услуга',category:'Тест',short_description:'Описание',description:'Описание услуги',stages:'Этап',unit:'м²',base_price_rub:'100.00',is_active:true,sort_order:1}
 
-function CartHarness(){const{items,add,setQuantity}=useCart();return <><button onClick={()=>add(service,2)}>add</button><button onClick={()=>setQuantity(1,5)}>change</button><span>{items[0]?.quantity||0}</span></>}
+function CartHarness(){const{items,add,addMany,setQuantity}=useCart();return <><button onClick={()=>add(service,2)}>add</button><button onClick={()=>addMany([{service,quantity:3},{service:{...service,id:2,name:'Вторая услуга'},quantity:4}])}>many-cart</button><button onClick={()=>setQuantity(1,5)}>change</button><span data-testid="cart-quantity">{items[0]?.quantity||0}</span><span data-testid="cart-count">{items.length}</span></>}
 function ToastHarness(){const{notify}=useToast();return <><button onClick={()=>notify({type:'success',title:'Готово'})}>same</button><button onClick={()=>['Один','Два','Три','Четыре'].forEach(title=>notify({type:'info',title}))}>many</button></>}
 
 describe('UI feedback',()=>{
@@ -20,4 +22,7 @@ describe('UI feedback',()=>{
   it('keeps no more than three visible toasts',()=>{render(<ToastProvider><ToastHarness/></ToastProvider>);fireEvent.click(screen.getByText('many'));expect(screen.queryByText('Один')).not.toBeInTheDocument();expect(screen.getAllByRole('status')).toHaveLength(3)})
   it('announces a catalog addition and distinguishes an update',()=>{render(<MemoryRouter><ToastProvider><CartProvider><ServiceCard service={service}/></CartProvider></ToastProvider></MemoryRouter>);const add=screen.getByRole('button',{name:'Добавить Тестовая услуга'});fireEvent.click(add);expect(screen.getByText('Добавлено в корзину')).toBeInTheDocument();fireEvent.click(add);expect(screen.getByText('Количество обновлено')).toBeInTheDocument()})
   it('renders an accessible confirmation modal',()=>{render(<Modal title="Очистить корзину?" onClose={()=>{}}><p>Подтверждение</p></Modal>);expect(screen.getByRole('dialog',{name:'Очистить корзину?'})).toBeInTheDocument()})
+  it('renders GFM markdown and blocks unsafe HTML and links',()=>{const{container}=render(<MarkdownMessage>{'# Заголовок\n\n**Жирный текст**\n\n- Один\n- Два\n\n[опасно](javascript:alert(1))\n\n<script>alert(2)</script>'}</MarkdownMessage>);expect(screen.getByRole('heading',{name:'Заголовок'})).toBeInTheDocument();expect(screen.getByText('Жирный текст').tagName).toBe('STRONG');expect(screen.getAllByRole('listitem')).toHaveLength(2);expect(screen.getByText('опасно').closest('a')).toBeNull();expect(container.querySelector('script')).toBeNull()})
+  it('adds multiple cart entries atomically, merges duplicates and persists them',async()=>{render(<MemoryRouter><CartProvider><CartHarness/></CartProvider></MemoryRouter>);fireEvent.click(screen.getByText('add'));fireEvent.click(screen.getByText('many-cart'));expect(screen.getByTestId('cart-quantity')).toHaveTextContent('5');expect(screen.getByTestId('cart-count')).toHaveTextContent('2');await waitFor(()=>expect(JSON.parse(localStorage.getItem('sk-cart')||'[]')).toHaveLength(2))})
+  it('adds the server-verified assistant quantity to the existing cart',async()=>{vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request)=>{const url=String(input);if(url.endsWith('/assistant/chat'))return new Response(JSON.stringify({answer:'### Укладка плитки\n\n**Расчёт готов**',mode:'demo',cart_actions:[{action:'add_to_cart',service_id:1,name:service.name,unit:'м²',quantity:'24.00',unit_price_rub:'100.00',line_total_rub:'2400.00'}]}),{status:200,headers:{'Content-Type':'application/json'}});if(url.endsWith('/services'))return new Response(JSON.stringify([service]),{status:200,headers:{'Content-Type':'application/json'}});return new Response('{}',{status:404})}));render(<MemoryRouter><ToastProvider><CartProvider><AssistantChat/><CartHarness/></CartProvider></ToastProvider></MemoryRouter>);fireEvent.click(screen.getByRole('button',{name:'Открыть ИИ-помощника'}));fireEvent.change(screen.getByLabelText('Сообщение помощнику'),{target:{value:'Рассчитай 24 м²'}});fireEvent.click(screen.getByRole('button',{name:'Отправить'}));expect(await screen.findByRole('heading',{name:'Укладка плитки'})).toBeInTheDocument();fireEvent.click(screen.getByRole('button',{name:/Добавить — 24.00 м²/}));await waitFor(()=>expect(screen.getByTestId('cart-quantity')).toHaveTextContent('24'));expect(screen.getByRole('button',{name:/Добавлено/})).toBeDisabled();expect(screen.getByText('Перейти в корзину →')).toBeInTheDocument();vi.unstubAllGlobals()})
 })

@@ -194,6 +194,45 @@ def test_llm_success_is_visible(monkeypatch):
     assert "warning" not in result
 
 
+def test_assistant_returns_verified_cart_action_with_quantity():
+    with SessionLocal() as db:
+        result = assistant.demo_client_answer(
+            db, ChatIn(message="Сколько стоит укладка плитки на 24 м²?")
+        )
+    assert len(result["cart_actions"]) == 1
+    action = result["cart_actions"][0]
+    assert action["quantity"] == Decimal("24.00")
+    assert action["unit"] == "м²"
+    assert action["line_total_rub"] == action["unit_price_rub"] * Decimal("24")
+    assert result["quote"]["items"][0]["service_id"] == action["service_id"]
+
+
+def test_assistant_calculates_multiple_services_without_duplicates():
+    with SessionLocal() as db:
+        result = assistant.demo_client_answer(
+            db,
+            ChatIn(
+                message="Рассчитай штукатурку стен 50 м² и покраску стен 50 м²"
+            ),
+        )
+    actions = result["cart_actions"]
+    assert len(actions) == 2
+    assert len({action["service_id"] for action in actions}) == 2
+    assert all(action["quantity"] == Decimal("50.00") for action in actions)
+    assert Decimal(result["quote"]["estimated_total_rub"]) == sum(
+        (action["line_total_rub"] for action in actions), Decimal("0")
+    )
+
+
+def test_assistant_never_creates_action_for_unknown_service():
+    with SessionLocal() as db:
+        result = assistant.demo_client_answer(
+            db, ChatIn(message="Рассчитай монтаж бассейна на 24 м²")
+        )
+    assert result["cart_actions"] == []
+    assert result["quote"] is None
+
+
 def test_llm_http_error_returns_demo_with_warning(monkeypatch):
     monkeypatch.setattr(assistant, "get_settings", llm_settings)
 
