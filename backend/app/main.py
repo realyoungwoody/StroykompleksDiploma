@@ -37,7 +37,7 @@ from .schemas import (
     TrackOut,
 )
 from .seed import FAQ, seed_database
-from .services.assistant import client_answer, demo_admin_answer, order_statistics
+from .services.assistant import admin_answer, client_answer, order_statistics
 from .services.pricing import calculate_quote
 
 settings = get_settings()
@@ -126,7 +126,15 @@ def order_dict(order: Order, include_private: bool = True) -> dict:
 @app.get("/api/v1/health")
 def health(db: Session = Depends(get_db)):
     db.execute(select(1))
-    return {"status": "ok", "database": "connected", "ai_mode": settings.llm_mode}
+    return {
+        "status": "ok",
+        "database": "connected",
+        "ai_mode": settings.llm_mode,
+        "ai_configured": bool(
+            settings.llm_api_key and settings.llm_base_url and settings.llm_model
+        ),
+        "ai_model": settings.llm_model or None,
+    }
 
 
 @app.get("/api/v1/services", response_model=list[ServiceOut])
@@ -448,4 +456,4 @@ def admin_assistant(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ):
-    return demo_admin_answer(db, payload.message)
+    return admin_answer(db, payload.message)
