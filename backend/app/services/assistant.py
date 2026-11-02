@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -15,6 +16,8 @@ from .pricing import calculate_quote
 from ..seed import FAQ
 
 logger = logging.getLogger(__name__)
+LLM_RETRY_DELAYS = (0.25, 0.75)
+LLM_RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
 def _llm_warning(exc: Exception, model: str) -> str:
@@ -48,13 +51,34 @@ def _llm_warning(exc: Exception, model: str) -> str:
 
 def _call_llm(messages: list[dict[str, str]]) -> str:
     settings = get_settings()
-    response = httpx.post(
-        f"{settings.llm_base_url.rstrip('/')}/chat/completions",
-        headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-        json={"model": settings.llm_model, "messages": messages},
-        timeout=settings.llm_timeout_seconds,
-    )
-    response.raise_for_status()
+    response = None
+    for attempt in range(len(LLM_RETRY_DELAYS) + 1):
+        try:
+            response = httpx.post(
+                f"{settings.llm_base_url.rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+                json={"model": settings.llm_model, "messages": messages},
+                timeout=settings.llm_timeout_seconds,
+            )
+            response.raise_for_status()
+            break
+        except httpx.HTTPStatusError as exc:
+            retryable = exc.response.status_code in LLM_RETRY_STATUSES
+            if not retryable or attempt >= len(LLM_RETRY_DELAYS):
+                raise
+        except httpx.RequestError:
+            if attempt >= len(LLM_RETRY_DELAYS):
+                raise
+        delay = LLM_RETRY_DELAYS[attempt]
+        logger.info(
+            "Retrying LLM request: attempt=%s model=%s delay_seconds=%s",
+            attempt + 2,
+            settings.llm_model,
+            delay,
+        )
+        time.sleep(delay)
+    if response is None:
+        raise RuntimeError("LLM request did not produce a response")
     data: dict[str, Any] = response.json()
     content = data["choices"][0]["message"]["content"]
     if not isinstance(content, str) or not content.strip():
