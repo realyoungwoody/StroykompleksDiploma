@@ -16,6 +16,7 @@ from ..core.config import get_settings
 from ..models import Order, OrderItem, Service
 from ..schemas import ChatIn, ItemIn
 from .pricing import calculate_quote
+from .selection import update_selection
 from ..seed import FAQ
 
 logger = logging.getLogger(__name__)
@@ -732,10 +733,33 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
 
 def client_answer(db: Session, payload: ChatIn) -> dict:
     settings = get_settings()
-    if not _llm_configured():
-        return demo_client_answer(db, payload)
+    selection = update_selection(db, payload)
     fallback = demo_client_answer(db, payload)
-    if not fallback.get("cart_actions") and not fallback.get("navigate_to"):
+    fallback["selection"] = selection.selection
+    if selection.actions:
+        fallback["cart_actions"] = selection.actions
+        fallback["quote"] = selection.quote
+        fallback["calculation_id"] = selection.calculation_id
+        fallback["answer"] = _quote_markdown(selection.actions)
+        fallback["sources"] = [
+            {"type": "catalog", "title": "Проверенный каталог услуг"}
+        ]
+    elif selection.selection["items"]:
+        fallback["cart_actions"] = []
+        fallback["quote"] = selection.quote
+        fallback.pop("calculation_id", None)
+        incomplete = [
+            item
+            for item in selection.selection["items"]
+            if item["status"] == "incomplete"
+        ]
+        if incomplete:
+            details = "; ".join(
+                f"{item['name']}: {', '.join(item['missing_parameters'])}"
+                for item in incomplete
+            )
+            fallback["answer"] = f"Для завершения расчёта уточните: {details}."
+    elif not fallback.get("cart_actions") and not fallback.get("navigate_to"):
         proposed_actions, proposed_quote = _confirmed_history_cart_actions(db, payload)
         if not proposed_actions:
             proposed_actions, proposed_quote = _llm_cart_actions(db, payload)
@@ -749,6 +773,8 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
             fallback["sources"] = [
                 {"type": "catalog", "title": "Проверенный каталог услуг"}
             ]
+    if not _llm_configured():
+        return fallback
     lower = payload.message.lower()
     if fallback.get("navigate_to") or (
         payload.context_actions
@@ -801,6 +827,17 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
             "Не говори, что кнопка добавления уже показана; попроси пользователя "
             "уточнить услугу и площадь, если они нужны для расчёта."
         )
+    incomplete_selection = [
+        item
+        for item in selection.selection["items"]
+        if item["status"] == "incomplete"
+    ]
+    if incomplete_selection:
+        context += "\n\nНезавершённые позиции подбора:\n" + "\n".join(
+            f"- {item['name']}: нужно уточнить {', '.join(item['missing_parameters'])}"
+            for item in incomplete_selection
+        )
+        context += "\nЗадай один вопрос по недостающим параметрам."
     if payload.cart:
         services = {
             service.id: service
