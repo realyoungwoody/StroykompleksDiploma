@@ -221,6 +221,117 @@ def _extract_numbers(text: str) -> set[Decimal]:
     }
 
 
+def _assistant_requested_area(text: str) -> bool:
+    lower = text.lower()
+    return any(term in lower for term in ("площад", "квадратн", "м²", "кв. м"))
+
+
+def _is_affirmative(text: str) -> bool:
+    words = re.findall(r"[а-яё]+", text.lower())
+    allowed = {
+        "да",
+        "верно",
+        "правильно",
+        "точно",
+        "тоже",
+        "всё",
+        "все",
+        "так",
+        "согласен",
+        "согласна",
+    }
+    return bool(words) and set(words) <= allowed and any(
+        word in {"да", "верно", "правильно", "точно", "согласен", "согласна"}
+        for word in words
+    )
+
+
+def _confirmed_history_quantities(payload: ChatIn) -> set[Decimal]:
+    """Resolve an explicit area that the user confirms with a short affirmative."""
+    if not payload.history or not _is_affirmative(payload.message):
+        return set()
+    previous = payload.history[-1]
+    if previous.role != "assistant" or not _assistant_requested_area(previous.content):
+        return set()
+    proposed = set(_extract_areas(previous.content))
+    if not proposed:
+        return set()
+    user_numbers = {
+        quantity
+        for message in payload.history[-6:]
+        if message.role == "user"
+        for quantity in _extract_numbers(message.content)
+    }
+    return proposed & user_numbers
+
+
+def _allowed_action_quantities(payload: ChatIn) -> set[Decimal]:
+    quantities = set(_extract_areas(payload.message))
+    recent_assistant_requested_area = any(
+        message.role == "assistant" and _assistant_requested_area(message.content)
+        for message in payload.history[-2:]
+    )
+    if not quantities and recent_assistant_requested_area:
+        quantities = _extract_numbers(payload.message)
+    if not quantities:
+        quantities = _confirmed_history_quantities(payload)
+    return quantities
+
+
+def _explicit_service_slugs(text: str) -> set[str]:
+    """Return only variants named by a service-specific catalog pattern."""
+    normalized = text.lower()
+    return {
+        slug
+        for slug, patterns in SERVICE_QUERY_PATTERNS.items()
+        if patterns and re.search(patterns[0][0], normalized)
+    }
+
+
+def _confirmed_history_cart_actions(
+    db: Session, payload: ChatIn
+) -> tuple[list[dict], dict | None]:
+    """Build actions without an LLM when the user confirms a proposed known area."""
+    quantities = _confirmed_history_quantities(payload)
+    if len(quantities) != 1:
+        return [], None
+    quantity = next(iter(quantities))
+    if not Decimal("0.1") <= quantity <= Decimal("10000"):
+        return [], None
+    user_context = "\n".join(
+        message.content for message in payload.history[-6:] if message.role == "user"
+    )
+    slugs = _explicit_service_slugs(user_context)
+    if not slugs or len(slugs) > 5:
+        return [], None
+    services = db.scalars(
+        select(Service)
+        .where(Service.is_active.is_(True), Service.slug.in_(slugs))
+        .order_by(Service.sort_order, Service.name)
+    ).all()
+    if len(services) != len(slugs):
+        return [], None
+    quote = calculate_quote(
+        db,
+        [ItemIn(service_id=service.id, quantity=quantity) for service in services],
+    )
+    note = _preference_note(user_context)
+    actions = [
+        {
+            "action": "add_to_cart",
+            "service_id": line.service_id,
+            "name": line.name,
+            "unit": line.unit,
+            "quantity": line.quantity,
+            "unit_price_rub": line.unit_price_rub,
+            "line_total_rub": line.line_total_rub,
+            "note": note,
+        }
+        for line in quote.items
+    ]
+    return actions, quote.model_dump(mode="json")
+
+
 def _calculated_cart_actions(db: Session, query: str) -> tuple[list[dict], dict | None]:
     """Build cart actions only from catalog services and server-side pricing."""
     segments = [
@@ -285,17 +396,7 @@ def _preference_note(text: str) -> str | None:
 
 def _llm_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | None]:
     """Accept LLM service proposals only after strict catalog and price validation."""
-    explicit_quantities = set(_extract_areas(payload.message))
-    recent_assistant_requested_area = any(
-        message.role == "assistant"
-        and any(
-            term in message.content.lower()
-            for term in ("площад", "квадратн", "м²", "кв. м")
-        )
-        for message in payload.history[-2:]
-    )
-    if not explicit_quantities and recent_assistant_requested_area:
-        explicit_quantities = _extract_numbers(payload.message)
+    explicit_quantities = _allowed_action_quantities(payload)
     if not explicit_quantities:
         return [], None
     services = db.scalars(
@@ -333,7 +434,8 @@ def _llm_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | 
                         '{"items":[{"service_slug":"slug","quantity":"25"}]}. '
                         "Выбирай только slug из каталога. Добавляй позицию только если "
                         "услуга однозначно следует из текущего сообщения или истории, а "
-                        "количество явно указано в последнем сообщении пользователя. "
+                        "количество явно указано пользователем либо подтверждено коротким "
+                        "ответом на вопрос ассистента о той же площади. "
                         "Свяжи каждое число с правильной ранее выбранной услугой. Иначе "
                         "верни {\"items\":[]}. Не вычисляй цены.\n"
                         f"Каталог:\n{catalog}"
@@ -634,7 +736,9 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
         return demo_client_answer(db, payload)
     fallback = demo_client_answer(db, payload)
     if not fallback.get("cart_actions") and not fallback.get("navigate_to"):
-        proposed_actions, proposed_quote = _llm_cart_actions(db, payload)
+        proposed_actions, proposed_quote = _confirmed_history_cart_actions(db, payload)
+        if not proposed_actions:
+            proposed_actions, proposed_quote = _llm_cart_actions(db, payload)
         if proposed_actions:
             fallback["cart_actions"] = proposed_actions
             fallback["quote"] = proposed_quote

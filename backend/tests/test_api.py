@@ -583,6 +583,84 @@ def test_llm_resolves_multiple_actions_from_recent_dialog_history(monkeypatch):
     assert "площадь стен и площадь пола" in classifier_context
 
 
+def test_affirmative_reply_builds_actions_from_confirmed_dialog_state(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+    json_calls = 0
+
+    def call(_messages, *, json_mode=False):
+        nonlocal json_calls
+        if json_mode:
+            json_calls += 1
+            return '{"items":[]}'
+        return "Расчёт готов. Используйте кнопки под ответом."
+
+    monkeypatch.setattr(assistant, "_call_llm", call)
+    history = [
+        ChatMessage(
+            role="user",
+            content="нужна покраска стен штукатурка 90 метров кважратных",
+        ),
+        ChatMessage(
+            role="assistant",
+            content=(
+                "Какой тип штукатурки вам нужен и какой краской планируете "
+                "покраску?"
+            ),
+        ),
+        ChatMessage(role="user", content="механизированная масляная краска"),
+        ChatMessage(
+            role="assistant",
+            content=(
+                "Для расчёта уточните площадь покраски — тоже 90 м² "
+                "или другое значение?"
+            ),
+        ),
+    ]
+    with SessionLocal() as db:
+        result = assistant.client_answer(
+            db,
+            ChatIn(message="да", history=history),
+        )
+
+    actions = result["cart_actions"]
+    assert json_calls == 0
+    assert {action["service_id"] for action in actions} == {1, 4}
+    assert {action["quantity"] for action in actions} == {Decimal("90.00")}
+    assert Decimal(result["quote"]["estimated_total_rub"]) == Decimal("114300.00")
+    assert all(action["calculation_id"] == result["calculation_id"] for action in actions)
+
+
+def test_affirmative_reply_cannot_confirm_area_absent_from_user_history(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+    json_calls = 0
+
+    def call(_messages, *, json_mode=False):
+        nonlocal json_calls
+        if json_mode:
+            json_calls += 1
+            return (
+                '{"items":['
+                '{"service_slug":"pokraska-maslyanaya","quantity":"90"}'
+                "]}"
+            )
+        return "Уточните площадь работ."
+
+    monkeypatch.setattr(assistant, "_call_llm", call)
+    history = [
+        ChatMessage(role="user", content="Нужна масляная покраска"),
+        ChatMessage(role="assistant", content="Площадь составляет 90 м²?"),
+    ]
+    with SessionLocal() as db:
+        result = assistant.client_answer(
+            db,
+            ChatIn(message="да", history=history),
+        )
+
+    assert json_calls == 0
+    assert result["cart_actions"] == []
+    assert result["quote"] is None
+
+
 def test_llm_does_not_treat_bare_numbers_as_quantities_without_area_request(
     monkeypatch,
 ):
