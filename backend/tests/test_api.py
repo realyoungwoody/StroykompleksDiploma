@@ -405,6 +405,7 @@ def test_assistant_preserves_preference_and_conversation_action():
             ChatIn(message="Мне нужен натяжной потолок красного цвета 50 м²"),
         )
         action = first["cart_actions"][0]
+        assert action["service_id"] == 7
         assert action["quantity"] == Decimal("50.00")
         assert "красный" in action["note"]
         follow_up = assistant.demo_client_answer(
@@ -433,6 +434,97 @@ def test_assistant_preserves_preference_and_conversation_action():
     assert follow_up["cart_actions"][0]["service_id"] == action["service_id"]
     assert follow_up["cart_actions"][0]["quantity"] == Decimal("50.00")
     assert "Стройкомплекса" in follow_up["answer"]
+
+
+def test_assistant_distinguishes_service_variants_and_color():
+    with SessionLocal() as db:
+        manual = assistant.demo_client_answer(
+            db, ChatIn(message="Ручная штукатурка, площадь 25")
+        )
+        mechanized = assistant.demo_client_answer(
+            db, ChatIn(message="Механизированная штукатурка 25 квадратных метров")
+        )
+        red_ceiling = assistant.demo_client_answer(
+            db, ChatIn(message="Хочу красный натяжной потолок 50 м²")
+        )
+    assert manual["cart_actions"][0]["service_id"] == 2
+    assert manual["cart_actions"][0]["quantity"] == Decimal("25.00")
+    assert mechanized["cart_actions"][0]["service_id"] == 1
+    assert red_ceiling["cart_actions"][0]["service_id"] == 7
+    assert "красный" in red_ceiling["cart_actions"][0]["note"]
+
+
+def test_catalog_question_has_complete_deterministic_knowledge():
+    with SessionLocal() as db:
+        result = assistant.demo_client_answer(
+            db, ChatIn(message="Какие услуги вы оказываете?")
+        )
+    assert result["cart_actions"] == []
+    assert "Механизированная штукатурка стен" in result["answer"]
+    assert "Монтаж натяжного потолка" in result["answer"]
+    assert "Укладка ламината" in result["answer"]
+
+
+def test_llm_receives_full_catalog_and_button_state(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+    sent_messages = []
+
+    def post(*_args, **kwargs):
+        sent_messages.extend(kwargs["json"]["messages"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://provider.example/v1/chat/completions"),
+            json={"choices": [{"message": {"content": "Уточните услугу и площадь."}}]},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    with SessionLocal() as db:
+        result = assistant.client_answer(
+            db, ChatIn(message="Расскажите, чем вы занимаетесь")
+        )
+    context = "\n".join(message["content"] for message in sent_messages)
+    assert result["mode"] == "llm"
+    assert "полный список услуг" in context
+    assert "Монтаж натяжного потолка" in context
+    assert "Подтверждённого серверного расчёта сейчас нет" in context
+
+
+def test_llm_can_propose_action_but_backend_validates_and_prices_it(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+
+    def call(messages, *, json_mode=False):
+        if json_mode:
+            return '{"items":[{"service_slug":"pokraska-vodoemulsionnaya","quantity":"40"}]}'
+        return "Расчёт проверен. Используйте кнопку под ответом."
+
+    monkeypatch.setattr(assistant, "_call_llm", call)
+    with SessionLocal() as db:
+        result = assistant.client_answer(
+            db, ChatIn(message="Нужно освежить стены валиком, 40 м²")
+        )
+    action = result["cart_actions"][0]
+    assert result["mode"] == "llm"
+    assert action["service_id"] == 3
+    assert action["quantity"] == Decimal("40.00")
+    assert action["line_total_rub"] == Decimal("16800.00")
+    assert result["calculation_id"] == action["calculation_id"]
+
+
+def test_llm_action_proposal_cannot_invent_quantity(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+
+    def call(_messages, *, json_mode=False):
+        if json_mode:
+            return '{"items":[{"service_slug":"natyazhnoy-potolok","quantity":"99"}]}'
+        return "Уточните параметры расчёта."
+
+    monkeypatch.setattr(assistant, "_call_llm", call)
+    with SessionLocal() as db:
+        result = assistant.client_answer(
+            db, ChatIn(message="Сделать современный верх комнаты на 50 м²")
+        )
+    assert result["cart_actions"] == []
+    assert result["quote"] is None
 
 
 def test_assistant_updates_context_quantity_and_knows_cart_state():
