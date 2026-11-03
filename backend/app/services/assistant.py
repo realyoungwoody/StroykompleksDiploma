@@ -214,6 +214,13 @@ def _extract_area(text: str) -> Decimal | None:
     return quantities[0] if quantities else None
 
 
+def _extract_numbers(text: str) -> set[Decimal]:
+    return {
+        Decimal(match.group(1).replace(",", "."))
+        for match in re.finditer(r"(?<!\d)(\d+(?:[.,]\d+)?)(?!\d)", text)
+    }
+
+
 def _calculated_cart_actions(db: Session, query: str) -> tuple[list[dict], dict | None]:
     """Build cart actions only from catalog services and server-side pricing."""
     segments = [
@@ -279,6 +286,16 @@ def _preference_note(text: str) -> str | None:
 def _llm_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | None]:
     """Accept LLM service proposals only after strict catalog and price validation."""
     explicit_quantities = set(_extract_areas(payload.message))
+    recent_assistant_requested_area = any(
+        message.role == "assistant"
+        and any(
+            term in message.content.lower()
+            for term in ("площад", "квадратн", "м²", "кв. м")
+        )
+        for message in payload.history[-2:]
+    )
+    if not explicit_quantities and recent_assistant_requested_area:
+        explicit_quantities = _extract_numbers(payload.message)
     if not explicit_quantities:
         return [], None
     services = db.scalars(
@@ -295,6 +312,17 @@ def _llm_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | 
         "[персональные данные скрыты]",
         payload.message,
     )
+    safe_history = [
+        {
+            "role": message.role,
+            "content": re.sub(
+                r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
+                "[персональные данные скрыты]",
+                message.content,
+            ),
+        }
+        for message in payload.history[-6:]
+    ]
     try:
         raw = _call_llm(
             [
@@ -304,11 +332,14 @@ def _llm_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | 
                         "Ты — машинный классификатор услуг. Верни только JSON вида "
                         '{"items":[{"service_slug":"slug","quantity":"25"}]}. '
                         "Выбирай только slug из каталога. Добавляй позицию только если "
-                        "услуга однозначно соответствует словам пользователя, а количество "
-                        "явно указано им. Иначе верни {\"items\":[]}. Не вычисляй цены.\n"
+                        "услуга однозначно следует из текущего сообщения или истории, а "
+                        "количество явно указано в последнем сообщении пользователя. "
+                        "Свяжи каждое число с правильной ранее выбранной услугой. Иначе "
+                        "верни {\"items\":[]}. Не вычисляй цены.\n"
                         f"Каталог:\n{catalog}"
                     ),
                 },
+                *safe_history,
                 {"role": "user", "content": safe_message},
             ],
             json_mode=True,
