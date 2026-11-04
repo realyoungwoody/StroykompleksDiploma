@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from ..models import Service
 from ..schemas import ChatIn, ItemIn
 from .pricing import calculate_quote
-from .quantities import extract_area_quantities
+from .quantities import bounded_message, extract_area_quantities
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +165,10 @@ def _clauses(text: str) -> list[str]:
     service_start = r"(?:штукатур|покрас|окрас|краск|плит|облицов|потол|ламин|механиз|ручн|водоэмульс|маслян|натяжн)"
     return [
         part.strip()
-        for part in re.split(rf"[,;]|\s+и\s+(?={service_start})", text.lower())
+        for part in re.split(
+            rf"[,;]|\s{{1,16}}и\s{{1,16}}(?={service_start})",
+            bounded_message(text).lower(),
+        )
         if part.strip()
     ]
 

@@ -12,7 +12,7 @@ cd backend
 
 Тесты используют временную SQLite и очищают cached settings/modules через fixtures. Покрываются каталог, расчёты, заявки, idempotency, tracking, admin auth/CRUD/metrics, LLM fallback/actions и selection.
 
-Текущее контрольное состояние на 4 ноября 2026 после ReDoS regression-тестов: Ruff PASS, `197 passed`; остаются два предупреждения FastAPI о deprecated `on_event`.
+Текущее контрольное состояние на 4 ноября 2026 после security regression-тестов: Ruff PASS, `200 passed`; остаются два предупреждения FastAPI о deprecated `on_event`.
 
 ## Frontend
 

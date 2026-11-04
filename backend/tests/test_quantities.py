@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from app.schemas import CHAT_MESSAGE_MAX_LENGTH, ChatIn
 from app.services.assistant import (
+    SERVICE_SEGMENT_PATTERN,
     _extract_areas,
     _extract_numbers,
     _mask_personal_data,
@@ -68,6 +69,24 @@ def test_long_digit_sequence_is_not_split_into_false_quantity():
 def test_long_whitespace_sequence_is_bounded_and_not_recognized():
     message = "50" + " " * 100_000 + "м²"
     assert extract_area_quantities(message, include_words=True) == []
+
+
+def test_service_segment_separator_rejects_unbounded_whitespace_runs():
+    message = "Штукатурка 50 м²" + " " * 100_000 + "и покраска 50 м²"
+    assert SERVICE_SEGMENT_PATTERN.split(message[:CHAT_MESSAGE_MAX_LENGTH]) == [
+        message[:CHAT_MESSAGE_MAX_LENGTH]
+    ]
+
+
+def test_service_segment_separator_supports_normal_customer_phrasing():
+    parts = SERVICE_SEGMENT_PATTERN.split(
+        "Штукатурка 50 м² а также покраска 50,5 м²; плитка 20м2"
+    )
+    assert [part.strip() for part in parts] == [
+        "Штукатурка 50 м²",
+        "покраска 50,5 м²",
+        "плитка 20м2",
+    ]
 
 
 def test_internal_scanners_apply_chat_message_length_limit():
