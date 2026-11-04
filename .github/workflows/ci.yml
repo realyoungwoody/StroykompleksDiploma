@@ -150,6 +150,7 @@ jobs:
             --label com.docker.compose.service=web \
             --label com.docker.compose.project=diplomasite \
             --label "com.docker.compose.project.working_dir=$deploy_test_root" \
+            --network stroykompleks-ci_default \
             -p 8080:80 \
             diplomasite-web:latest
 
