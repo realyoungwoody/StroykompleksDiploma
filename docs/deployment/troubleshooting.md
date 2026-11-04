@@ -57,4 +57,6 @@ GitHub иногда не создаёт новый `pull_request` run тольк
 
 ## Production deploy failed
 
-Проверьте шаг, на котором остановился workflow. Ошибка до SSH не меняет сервер. Build error сохраняет текущий release. Ошибка после старта вызывает diagnostics и попытку rollback. Сверьте `shared/deployed_sha`, `current`, backups, container logs и public HTTPS; не выполняйте `down -v`.
+Проверьте шаг, на котором остановился workflow. Ошибка до SSH не меняет сервер. Build error сохраняет текущий release. Ошибка после освобождения порта или старта вызывает diagnostics и попытку rollback. Сверьте `shared/deployed_sha`, `current`, backups, container logs и public HTTPS; не выполняйте `down -v`.
+
+Ошибка `Bind for 0.0.0.0:8080 failed: port is already allocated` означает, что порт удерживает другой контейнер. Актуальный deploy-скрипт безопасно останавливает старый `web`, если по Compose labels, deployment path или имени legacy image подтверждается принадлежность этому проекту. Для неизвестного контейнера он выводит его id, project, service и image и отказывается завершать чужой workload. В таком случае найдите владельца командой `docker ps --filter publish=8080` и исправьте конфликт вручную, не удаляя volumes.
