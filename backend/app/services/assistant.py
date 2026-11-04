@@ -16,12 +16,25 @@ from ..core.config import get_settings
 from ..models import Order, OrderItem, Service
 from ..schemas import ChatIn, ItemIn
 from .pricing import calculate_quote
+from .quantities import bounded_message, extract_area_quantities, extract_numbers
 from .selection import update_selection
 from ..seed import FAQ
 
 logger = logging.getLogger(__name__)
 LLM_RETRY_DELAYS = (0.25, 0.75)
 LLM_RETRY_STATUSES = {429, 500, 502, 503, 504}
+EMAIL_PATTERN = re.compile(
+    r"(?<![\w.+-])[\w.+-]{1,64}@[\w.-]{1,253}(?![\w.-])"
+)
+PHONE_PATTERN = re.compile(
+    r"(?<![\w+])(?:\+7|8)(?:[ ()-]{0,3}\d){10}"
+    r"(?!(?:[ ()-]{0,3}\d))"
+)
+
+
+def _mask_personal_data(text: str) -> str:
+    safe = EMAIL_PATTERN.sub("[персональные данные скрыты]", bounded_message(text))
+    return PHONE_PATTERN.sub("[персональные данные скрыты]", safe)
 
 
 def _llm_warning(exc: Exception, model: str) -> str:
@@ -193,21 +206,7 @@ def search_services(db: Session, query: str) -> list[Service]:
 
 
 def _extract_areas(text: str) -> list[Decimal]:
-    normalized = text.lower()
-    matches = list(
-        re.finditer(
-        r"(\d+(?:[.,]\d+)?)\s*(?:м2|м²|кв(?:адрат(?:н(?:ых|ого|ые)?)?)?(?:\.?)\s*(?:м(?:етр(?:а|ов)?)?)?|квадрат(?:а|ов)?)",
-        normalized,
-        )
-    )
-    if not matches:
-        matches = list(
-            re.finditer(
-            r"площад(?:ь|ью|и)\s*(?:около\s+|примерно\s+|[-—:]\s*)?(\d+(?:[.,]\d+)?)",
-            normalized,
-            )
-        )
-    return [Decimal(match.group(1).replace(",", ".")) for match in matches]
+    return extract_area_quantities(text)
 
 
 def _extract_area(text: str) -> Decimal | None:
@@ -216,10 +215,7 @@ def _extract_area(text: str) -> Decimal | None:
 
 
 def _extract_numbers(text: str) -> set[Decimal]:
-    return {
-        Decimal(match.group(1).replace(",", "."))
-        for match in re.finditer(r"(?<!\d)(\d+(?:[.,]\d+)?)(?!\d)", text)
-    }
+    return extract_numbers(text)
 
 
 def _assistant_requested_area(text: str) -> bool:
@@ -409,19 +405,11 @@ def _llm_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | 
     catalog = "\n".join(
         f"- {service.slug}: {service.name} ({service.unit})" for service in services
     )
-    safe_message = re.sub(
-        r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
-        "[персональные данные скрыты]",
-        payload.message,
-    )
+    safe_message = _mask_personal_data(payload.message)
     safe_history = [
         {
             "role": message.role,
-            "content": re.sub(
-                r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
-                "[персональные данные скрыты]",
-                message.content,
-            ),
+            "content": _mask_personal_data(message.content),
         }
         for message in payload.history[-6:]
     ]
@@ -853,19 +841,11 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
             for item in payload.cart
             if item.service_id in services
         )
-    safe_message = re.sub(
-        r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
-        "[персональные данные скрыты]",
-        payload.message,
-    )
+    safe_message = _mask_personal_data(payload.message)
     safe_history = [
         {
             "role": message.role,
-            "content": re.sub(
-                r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
-                "[персональные данные скрыты]",
-                message.content,
-            ),
+            "content": _mask_personal_data(message.content),
         }
         for message in payload.history[-6:]
     ]
@@ -953,11 +933,7 @@ def admin_answer(db: Session, message: str) -> dict:
     if not _llm_configured():
         return fallback
     stats = fallback["statistics"]
-    safe_message = re.sub(
-        r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
-        "[персональные данные скрыты]",
-        message,
-    )
+    safe_message = _mask_personal_data(message)
     context = (
         f"Всего заявок: {stats['total']}; по статусам: {stats['by_status']}; "
         f"новых старше 24 часов: {stats['overdue_new']}; "
