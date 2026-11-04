@@ -18,7 +18,7 @@ git switch dev
 cp .env.example .env
 ```
 
-Замените демонстрационные `ADMIN_PASSWORD` и `SESSION_SECRET`. Полный Compose-запуск, база, seed, logs и local LLM описаны в [Docker-инструкции](docker.md).
+Замените демонстрационные `ADMIN_PASSWORD` и `SESSION_SECRET`. Полный справочник конфигурации находится в разделе [переменных окружения и `.env`](environment.md), а Compose-запуск, база, seed, logs и local LLM описаны в [Docker-инструкции](docker.md).
 
 ## Backend
 

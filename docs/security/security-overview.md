@@ -22,7 +22,7 @@
 
 ## Секреты
 
-Секретами являются `ADMIN_PASSWORD`, `SESSION_SECRET`, `LLM_API_KEY`, deploy SSH key и provider tokens. Храните локальные runtime values в `.env` с ограниченными permissions, production deploy values — в GitHub Secrets и `shared/.env` сервера.
+Секретами являются `ADMIN_PASSWORD`, `SESSION_SECRET`, `LLM_API_KEY`, deploy SSH key и provider tokens. Храните локальные runtime values в `.env` с ограниченными permissions, production deploy values — в GitHub Secrets и `shared/.env` сервера. Разделение этих хранилищ и правила ротации описаны в [справочнике окружения](../deployment/environment.md#production).
 
 Не помещайте секреты в README, PR body, issue, commit, screenshot или чат. Если значение раскрыто, недостаточно удалить текст: отзовите credential у источника, создайте новый, обновите runtime и проверьте историю/логи.
 
