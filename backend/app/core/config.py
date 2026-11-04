@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_model: str = ""
     llm_timeout_seconds: int = 25
+    llm_max_tokens: int = 350
     model_config = SettingsConfigDict(
         env_file=Path(__file__).parents[3] / ".env", extra="ignore"
     )

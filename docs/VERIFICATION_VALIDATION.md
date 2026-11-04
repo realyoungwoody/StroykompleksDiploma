@@ -1,14 +1,14 @@
 # Отчёт о верификации и валидации
 
-Дата проверки: 27 октября 2026 года. Цель — подтвердить соответствие MVP техническому заданию и пригодность для демонстрации основных клиентских и административных сценариев.
+Дата последней полной автоматизированной проверки: 4 ноября 2026 года. Цель — подтвердить соответствие MVP техническому заданию и пригодность для демонстрации основных клиентских и административных сценариев.
 
 ## Среда и методы
 
-- host: macOS, доступный Python 3.9.6 (проект и контейнер рассчитаны на Python 3.12);
+- host: macOS; backend-контейнер и CI используют Python 3.12;
 - backend: FastAPI 0.115.6, SQLAlchemy 2.0.36, Pydantic 2.10.4;
-- frontend: React 18.3.1, TypeScript 5.7.2, Vite 6.0.5;
+- frontend: React 18.3.1, TypeScript 5.7.2, Vite 6.4.5, Vitest 5.0.5;
 - методы: pytest/TestClient, Ruff, TypeScript, Vitest, production build, локальная браузерная проверка через Vite + Uvicorn;
-- Docker отсутствовал в среде, поэтому Compose smoke и persistence после рестарта контейнеров не запускались.
+- Docker Compose build, запуск и HTTP smoke выполнены; backend и web достигли состояния `healthy`.
 
 ## Матрица трассируемости
 
@@ -29,20 +29,20 @@
 | FR-13 | Админ-агент | Functional/API | агрегированная сводка | PASS |
 | FR-14 | Fallback ИИ | Unit + Integration | `LLM_MODE=demo` | PASS |
 | FR-15 | Адаптивность | UI | 663 px viewport browser | PASS |
-| FR-16 | Docker запуск | Smoke | Docker CLI отсутствует | NOT RUN |
+| FR-16 | Docker запуск | Smoke | Compose build, up, health, HTTP smoke | PASS |
 | FR-17 | Защита admin API | Security | `test_unauthorized` | PASS |
 | FR-18 | Историческая цена | Integration | `test_historical_price` | PASS |
 | FR-19 | Идемпотентность | Integration | same/different fingerprint | PASS |
-| FR-20 | Данные после рестарта | Compose smoke | Docker CLI отсутствует | NOT RUN |
+| FR-20 | Данные после пересоздания контейнера | Compose smoke | persistent volume повторно подключён | PASS |
 
 ## Результаты команд
 
-- `pytest -q`: **10 passed**, 0 failed; два предупреждения о deprecated startup hook FastAPI.
+- `pytest -q`: **200 passed**, 0 failed; два предупреждения о deprecated startup hook FastAPI.
 - `ruff check app tests`: **PASS**, ошибок нет.
-- `pnpm run typecheck`: **PASS**.
-- `pnpm test`: **2 passed**, 0 failed.
-- `pnpm run build`: **PASS**, собрано 1597 модулей; JS 223.57 kB (gzip 71.80 kB), CSS 21.74 kB (gzip 5.32 kB).
-- Docker Compose smoke: **NOT RUN** — Docker отсутствует.
+- `npm run typecheck`: **PASS**.
+- `npm test`: **22 passed**, 0 failed.
+- `npm run build`: **PASS**, Vite 6.4.5 production build.
+- Docker Compose build/smoke: **PASS**; health сообщил подключённую SQLite и настроенный remote AI provider.
 - Полноценный Playwright test suite: **NOT RUN**; вместо него выполнена интерактивная браузерная проверка.
 
 ## Практическая валидация
@@ -81,6 +81,6 @@
 
 ## Известные ограничения и вывод
 
-Docker, container restart/persistence и Nginx smoke не проверены из-за отсутствия Docker CLI. Внешний LLM не вызывался: безопасный demo fallback проверен, HTTP-ветка реализована. Keyword retrieval упрощён и не является полноценным семантическим поиском. Rate limit сбрасывается при рестарте.
+Автоматизированы Docker/Nginx smoke и обе ветки LLM через mocks/fallback; реальный production VPS, DNS, HTTPS, rollback и восстановление backup требуют отдельной инфраструктуры. Keyword retrieval упрощён и не является полноценным семантическим поиском. Rate limit сбрасывается при рестарте.
 
 Итог: функциональные P0-сценарии на уровне кода, API и локального браузера подтверждены; MVP пригоден для демонстрации ВКР. Перед защитой на целевом компьютере следует один раз выполнить Docker smoke из README.
