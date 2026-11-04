@@ -5,7 +5,7 @@ import logging
 import re
 import secrets
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlparse
 
@@ -30,11 +30,81 @@ PHONE_PATTERN = re.compile(
     r"(?<![\w+])(?:\+7|8)(?:[ ()-]{0,3}\d){10}"
     r"(?!(?:[ ()-]{0,3}\d))"
 )
+SERVICE_SEGMENT_PATTERN = re.compile(
+    r"\s{1,16}(?:и|а\s{1,16}также)\s{1,16}|;",
+    re.IGNORECASE,
+)
+REMOTE_SAFE_TOKEN_PATTERN = re.compile(
+    r"(?<![а-яёa-z0-9])[а-яёa-z]{1,32}(?![а-яёa-z0-9])|"
+    r"(?<![\w.,+\-])\d{1,5}(?:[.,]\d{1,2})?(?![\d.,])",
+    re.IGNORECASE,
+)
+REMOTE_SAFE_WORD_PATTERN = re.compile(
+    r"(?:штукатур[а-яё]{0,12}|механиз[а-яё]{0,14}|ручн(?:ая|ой|ую|ое|ые)|"
+    r"покрас[а-яё]{0,12}|окрас[а-яё]{0,12}|краск(?:а|и|ой|у|е)|"
+    r"водоэмульс[а-яё]{0,16}|маслян[а-яё]{0,12}|плитк(?:а|и|ой|у|е)|"
+    r"облицов[а-яё]{0,14}|стен(?:а|ы|е|у|ой|ах|ам)?|"
+    r"пол(?:а|у|ом|ы|ов|ах|ам)?|потол[а-яё]{0,12}|натяжн[а-яё]{0,12}|"
+    r"ламин[а-яё]{0,12}|площад[а-яё]{0,10}|квадрат[а-яё]{0,12}|"
+    r"метр[а-яё]{0,8}|услуг[а-яё]{0,8}|стоимост[а-яё]{0,6}|цен(?:а|ы|е|у|ой)|"
+    r"рассчит[а-яё]{0,12}|расч[её]т[а-яё]{0,8}|корзин[а-яё]{0,8}|"
+    r"добав[а-яё]{0,12}|убер[а-яё]{0,10}|удал[а-яё]{0,10}|"
+    r"замен[а-яё]{0,10}|измен[а-яё]{0,10}|нуж(?:на|ен|но|ны)|"
+    r"хоч(?:у|ет|ете|ется)|сдел[а-яё]{0,10}|помог[а-яё]{0,8}|"
+    r"расскаж[а-яё]{0,8}|возможност[а-яё]{0,6}|привет|здравств[а-яё]{0,8})",
+    re.IGNORECASE,
+)
+QUANTITY_CONTEXT_ROOTS = (
+    "стен",
+    "пол",
+    "потол",
+    "площад",
+    "штукатур",
+    "покрас",
+    "плит",
+    "ламин",
+)
 
 
 def _mask_personal_data(text: str) -> str:
     safe = EMAIL_PATTERN.sub("[персональные данные скрыты]", bounded_message(text))
     return PHONE_PATTERN.sub("[персональные данные скрыты]", safe)
+
+
+def _remote_safe_text(text: str, *, allow_contextual_numbers: bool = False) -> str:
+    """Create a domain-only prompt without forwarding free-form customer data."""
+    bounded = bounded_message(text).lower()
+    area_values = set(extract_area_quantities(bounded, selection_units=True))
+    matches = list(REMOTE_SAFE_TOKEN_PATTERN.finditer(bounded))
+    safe_tokens: list[str] = []
+    previous_safe_word = ""
+    for match in matches:
+        token = match.group(0)
+        if token[0].isdigit():
+            try:
+                value = Decimal(token.replace(",", "."))
+            except InvalidOperation:
+                continue
+            has_quantity_context = any(
+                root in previous_safe_word for root in QUANTITY_CONTEXT_ROOTS
+            )
+            if value in area_values or (allow_contextual_numbers and has_quantity_context):
+                safe_tokens.append(token)
+            continue
+        if REMOTE_SAFE_WORD_PATTERN.fullmatch(token) or token in {"м", "м2", "кв"}:
+            safe_tokens.append(token)
+            previous_safe_word = token
+        else:
+            previous_safe_word = ""
+    if not safe_tokens:
+        return "Запрос без безопасных отраслевых параметров."
+    return "Безопасные параметры запроса: " + " ".join(safe_tokens)
+
+
+def _llm_safe_text(text: str, *, allow_contextual_numbers: bool = False) -> str:
+    if _llm_provider() == "local":
+        return _mask_personal_data(text)
+    return _remote_safe_text(text, allow_contextual_numbers=allow_contextual_numbers)
 
 
 def _llm_warning(exc: Exception, model: str) -> str:
@@ -333,7 +403,7 @@ def _calculated_cart_actions(db: Session, query: str) -> tuple[list[dict], dict 
     """Build cart actions only from catalog services and server-side pricing."""
     segments = [
         part.strip()
-        for part in re.split(r"\s+(?:и|а также)\s+|;", query, flags=re.IGNORECASE)
+        for part in SERVICE_SEGMENT_PATTERN.split(bounded_message(query))
         if part.strip()
     ]
     items: list[ItemIn] = []
@@ -405,11 +475,17 @@ def _llm_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | 
     catalog = "\n".join(
         f"- {service.slug}: {service.name} ({service.unit})" for service in services
     )
-    safe_message = _mask_personal_data(payload.message)
+    recent_area_request = any(
+        message.role == "assistant" and _assistant_requested_area(message.content)
+        for message in payload.history[-2:]
+    )
+    safe_message = _llm_safe_text(
+        payload.message, allow_contextual_numbers=recent_area_request
+    )
     safe_history = [
         {
             "role": message.role,
-            "content": _mask_personal_data(message.content),
+            "content": _llm_safe_text(message.content),
         }
         for message in payload.history[-6:]
     ]
@@ -841,11 +917,17 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
             for item in payload.cart
             if item.service_id in services
         )
-    safe_message = _mask_personal_data(payload.message)
+    recent_area_request = any(
+        message.role == "assistant" and _assistant_requested_area(message.content)
+        for message in payload.history[-2:]
+    )
+    safe_message = _llm_safe_text(
+        payload.message, allow_contextual_numbers=recent_area_request
+    )
     safe_history = [
         {
             "role": message.role,
-            "content": _mask_personal_data(message.content),
+            "content": _llm_safe_text(message.content),
         }
         for message in payload.history[-6:]
     ]
@@ -933,7 +1015,7 @@ def admin_answer(db: Session, message: str) -> dict:
     if not _llm_configured():
         return fallback
     stats = fallback["statistics"]
-    safe_message = _mask_personal_data(message)
+    safe_message = _llm_safe_text(message)
     context = (
         f"Всего заявок: {stats['total']}; по статусам: {stats['by_status']}; "
         f"новых старше 24 часов: {stats['overdue_new']}; "

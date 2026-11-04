@@ -579,8 +579,9 @@ def test_llm_resolves_multiple_actions_from_recent_dialog_history(monkeypatch):
     classifier_context = "\n".join(
         message["content"] for message in classified_messages
     )
-    assert "водоэмульсионную, плитку на пол" in classifier_context
-    assert "площадь стен и площадь пола" in classifier_context
+    assert "водоэмульсионную плитку пол" in classifier_context
+    assert "площадь стен площадь пола" in classifier_context
+    assert "стены 80 метров пол 20" in classifier_context.lower()
 
 
 def test_affirmative_reply_builds_actions_from_confirmed_dialog_state(monkeypatch):
@@ -839,8 +840,38 @@ def test_llm_receives_limited_sanitized_history(monkeypatch):
     with SessionLocal() as db:
         assistant.client_answer(db, ChatIn(message="А если красный?", history=history))
     messages = captured["messages"]
-    assert any(message["content"] == "Натяжной потолок 50 м²" for message in messages)
+    assert any("натяжной потолок 50 м" in message["content"] for message in messages)
     assert not any("+7 900" in message["content"] for message in messages)
+
+
+def test_remote_llm_receives_only_domain_allowlisted_customer_context(monkeypatch):
+    monkeypatch.setattr(assistant, "get_settings", llm_settings)
+    captured = {}
+
+    def post(*_args, **kwargs):
+        captured.update(kwargs["json"])
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://provider.example/v1/chat/completions"),
+            json={"choices": [{"message": {"content": "Расчёт уточняется"}}]},
+        )
+
+    monkeypatch.setattr(assistant.httpx, "post", post)
+    with SessionLocal() as db:
+        assistant.client_answer(
+            db,
+            ChatIn(
+                message=(
+                    "Я Иван Петров, адрес улица Ленина дом 10, телефон "
+                    "+7 999 123-45-67. Нужна покраска стен 50 м²"
+                )
+            ),
+        )
+
+    forwarded = captured["messages"][-1]["content"]
+    assert "покраска стен 50 м" in forwarded
+    for private_value in ("Иван", "Петров", "Ленина", "дом 10", "+7 999"):
+        assert private_value.lower() not in forwarded.lower()
 
 
 def test_admin_assistant_uses_llm_with_aggregate_context(monkeypatch):
