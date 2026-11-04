@@ -23,6 +23,7 @@ archive="$shared_dir/incoming/$release_sha.tar.gz"
 current_link="$deploy_root/current"
 previous_release=""
 deployment_started=0
+stopped_legacy_containers=()
 
 if [[ -L "$current_link" ]]; then
   previous_release=$(readlink -f "$current_link")
@@ -49,6 +50,62 @@ healthcheck() {
     sleep 3
   done
   return 1
+}
+
+stop_managed_web_on_public_port() {
+  local container_id service project working_dir config_files image normalized_image
+  local managed
+  local -a port_owners=()
+  mapfile -t port_owners < <(
+    docker ps --filter publish=8080 --format '{{.ID}}'
+  )
+  if [[ ${#port_owners[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  for container_id in "${port_owners[@]}"; do
+    service=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$container_id")
+    project=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$container_id")
+    working_dir=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$container_id")
+    config_files=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$container_id")
+    image=$(docker inspect -f '{{.Config.Image}}' "$container_id")
+    normalized_image=${image,,}
+    managed=0
+
+    if [[ "$service" == "web" ]] && {
+      [[ "$project" == "$compose_project" ]] \
+        || [[ "$working_dir" == "$deploy_root" ]] \
+        || [[ "$working_dir" == "$deploy_root/"* ]] \
+        || [[ "$config_files" == "$deploy_root/"* ]] \
+        || [[ "$normalized_image" =~ (^|/)(stroykompleks|diplomasite)[_-]web(:|@|$) ]];
+    }; then
+      managed=1
+    fi
+
+    if [[ "$managed" -ne 1 ]]; then
+      echo "Port 8080 is occupied by unmanaged container $container_id; refusing to stop it." >&2
+      echo "Compose project: ${project:-unknown}; service: ${service:-unknown}; image: ${image:-unknown}" >&2
+      return 1
+    fi
+
+    echo "Stopping managed web container $container_id to release port 8080"
+    docker stop --time 30 "$container_id" >/dev/null
+    if [[ "$project" != "$compose_project" ]]; then
+      stopped_legacy_containers+=("$container_id")
+    fi
+  done
+
+  if docker ps --filter publish=8080 --format '{{.ID}}' | grep -q .; then
+    echo "Port 8080 is still published after stopping managed web containers." >&2
+    return 1
+  fi
+}
+
+remove_stopped_legacy_containers() {
+  local container_id
+  for container_id in "${stopped_legacy_containers[@]}"; do
+    docker rm "$container_id" >/dev/null 2>&1 || true
+  done
 }
 
 wait_for_local_model() {
@@ -84,6 +141,7 @@ rollback() {
     ln -sfn "$previous_release" "$deploy_root/.current-rollback"
     mv -Tf "$deploy_root/.current-rollback" "$current_link"
     if healthcheck 20; then
+      remove_stopped_legacy_containers
       echo "Previous release restored; deployment still fails by design." >&2
     else
       echo "Rollback healthcheck failed." >&2
@@ -138,6 +196,7 @@ if [[ -n "$current_backend" ]] && docker inspect "$current_backend" >/dev/null 2
 fi
 
 deployment_started=1
+stop_managed_web_on_public_port
 compose_for "$release_dir" up -d --remove-orphans
 healthcheck 30
 wait_for_local_model
@@ -154,6 +213,7 @@ mv -Tf "$deploy_root/.current-next" "$current_link"
 printf '%s\n' "$release_sha" > "$shared_dir/deployed_sha"
 chmod 600 "$shared_dir/deployed_sha"
 rm -f -- "$archive"
+remove_stopped_legacy_containers
 
 mapfile -t release_paths < <(find "$releases_dir" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
 for ((index=keep_releases; index<${#release_paths[@]}; index++)); do
