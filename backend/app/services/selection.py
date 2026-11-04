@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from ..models import Service
 from ..schemas import ChatIn, ItemIn
 from .pricing import calculate_quote
+from .quantities import extract_area_quantities
 
 logger = logging.getLogger(__name__)
 
@@ -49,21 +50,6 @@ SLUG_PATTERNS = {
 SLUG_KIND = {
     slug: kind for kind, slugs in KIND_CANDIDATES.items() for slug in slugs
 }
-NUMBER_WORDS = {
-    "один": 1,
-    "десять": 10,
-    "двадцать": 20,
-    "тридцать": 30,
-    "сорок": 40,
-    "пятьдесят": 50,
-    "шестьдесят": 60,
-    "семьдесят": 70,
-    "восемьдесят": 80,
-    "девяносто": 90,
-    "сто": 100,
-}
-
-
 @dataclass
 class SelectionResult:
     selection: dict
@@ -74,18 +60,7 @@ class SelectionResult:
 
 
 def _quantities(text: str) -> list[Decimal]:
-    normalized = text.lower()
-    numeric = re.findall(
-        r"(?<!\d)(\d+(?:[.,]\d+)?)(?!\d)\s*"
-        r"(?:м2|м²|кв\.?\s*(?:м(?:етр(?:а|ов)?)?)?|"
-        r"квадрат\w*|метр(?:а|ов)?(?:\s+ква\w*)?)",
-        normalized,
-    )
-    values = [Decimal(value.replace(",", ".")) for value in numeric]
-    for word, value in NUMBER_WORDS.items():
-        if re.search(rf"\b{word}\b\s+(?:квадрат\w*|метр\w*|м²)", normalized):
-            values.append(Decimal(value))
-    return list(dict.fromkeys(values))
+    return extract_area_quantities(text, selection_units=True, include_words=True)
 
 
 def _mentioned_kinds(text: str) -> set[str]:

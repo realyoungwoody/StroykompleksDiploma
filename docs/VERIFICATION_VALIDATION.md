@@ -37,7 +37,7 @@
 
 ## Результаты команд
 
-- `pytest -q`: **170 passed**, 0 failed; два предупреждения о deprecated startup hook FastAPI.
+- `pytest -q`: **197 passed**, 0 failed; два предупреждения о deprecated startup hook FastAPI.
 - `ruff check app tests`: **PASS**, ошибок нет.
 - `npm run typecheck`: **PASS**.
 - `npm test`: **22 passed**, 0 failed.
