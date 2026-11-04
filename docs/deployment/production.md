@@ -44,7 +44,7 @@ sudo install -d -o deploy -g deploy -m 750 \
     └── deployed_sha
 ```
 
-Создайте `/opt/stroykompleks/shared/.env` с owner deploy и permission 600. Для HTTPS установите `COOKIE_SECURE=true`, сильные ADMIN_PASSWORD/SESSION_SECRET и выбранный LLM mode. Секреты не должны находиться в GitHub Variables или Git. Первый local-LLM deploy может скачивать модель и ждать готовность до 30 минут; volume сохраняется между releases.
+Создайте `/opt/stroykompleks/shared/.env` с owner deploy и permission 600. Готовый production-пример и отличие runtime `.env` от GitHub Secrets/Variables описаны в [справочнике окружения](environment.md#production). Для HTTPS установите `COOKIE_SECURE=true`, сильные ADMIN_PASSWORD/SESSION_SECRET и выбранный LLM mode. Секреты не должны находиться в GitHub Variables или Git. Первый local-LLM deploy может скачивать модель и ждать готовность до 30 минут; volume сохраняется между releases.
 
 ## GitHub Environment
 

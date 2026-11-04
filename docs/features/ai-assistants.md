@@ -81,6 +81,8 @@ docker compose --profile local up --build -d
 
 ## Настройка remote
 
+Полный справочник общих и Ollama-переменных, а также примеры `demo` и `local`, находятся в разделе [переменных окружения и `.env`](../deployment/environment.md).
+
 ```env
 LLM_MODE=remote
 LLM_API_KEY=replace-with-secret

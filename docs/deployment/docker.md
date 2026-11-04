@@ -9,7 +9,7 @@ cp .env.example .env
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Замените в `.env` `ADMIN_PASSWORD` и `SESSION_SECRET`. Для обычного HTTP localhost оставьте `COOKIE_SECURE=false`.
+Замените в `.env` `ADMIN_PASSWORD` и `SESSION_SECRET`. Для обычного HTTP localhost оставьте `COOKIE_SECURE=false`. Все переменные, значения по умолчанию и примеры трёх LLM-режимов приведены в [справочнике `.env`](environment.md).
 
 Без LLM:
 

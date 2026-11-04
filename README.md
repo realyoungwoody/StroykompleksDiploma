@@ -34,7 +34,7 @@ Backend — единственный источник цен и статусов
 cp .env.example .env
 ```
 
-Замените `ADMIN_PASSWORD` и `SESSION_SECRET`. Для запуска без модели установите в `.env` `LLM_MODE=demo`, затем:
+Замените `ADMIN_PASSWORD` и `SESSION_SECRET`. Полное описание всех значений и готовых режимов находится в [справочнике `.env`](docs/deployment/environment.md). Для запуска без модели установите в `.env` `LLM_MODE=demo`, затем:
 
 ```bash
 docker compose up --build -d
@@ -86,7 +86,7 @@ docker compose ps
 - [Функциональные возможности](docs/features/catalog.md)
 - [ИИ-помощники и кнопки корзины](docs/features/ai-assistants.md)
 - [API endpoints](docs/api/endpoints.md)
-- [Docker](docs/deployment/docker.md), [production](docs/deployment/production.md), [CI/CD](docs/deployment/cicd.md)
+- [Переменные окружения и `.env`](docs/deployment/environment.md), [Docker](docs/deployment/docker.md), [production](docs/deployment/production.md), [CI/CD](docs/deployment/cicd.md)
 - [Безопасность](docs/security/security-overview.md) и [тестирование](docs/testing/testing-guide.md)
 - [Contributing](docs/development/contributing.md) и [структура проекта](docs/development/project-structure.md)
 
