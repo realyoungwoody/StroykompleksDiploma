@@ -173,6 +173,34 @@ class ChatCartItem(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
+SelectionKind = Literal["plaster", "painting", "tile", "ceiling", "laminate"]
+
+
+class ChatSelectionItem(BaseModel):
+    selection_item_id: str = Field(
+        min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
+    )
+    kind: SelectionKind
+    service_id: int | None = None
+    quantity: Decimal | None = Field(
+        default=None,
+        ge=Decimal("0.1"),
+        le=Decimal("10000"),
+        max_digits=12,
+        decimal_places=2,
+    )
+    note: str | None = Field(default=None, max_length=500)
+    added: bool = False
+
+
+class ChatSelectionState(BaseModel):
+    conversation_id: str = Field(
+        min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
+    )
+    revision: int = Field(default=0, ge=0, le=1_000_000)
+    items: list[ChatSelectionItem] = Field(default_factory=list, max_length=20)
+
+
 class ChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=1500)
     conversation_id: str = Field(
@@ -184,3 +212,4 @@ class ChatIn(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list, max_length=6)
     context_actions: list[ChatActionContext] = Field(default_factory=list, max_length=20)
     cart: list[ChatCartItem] = Field(default_factory=list, max_length=20)
+    selection: ChatSelectionState | None = None

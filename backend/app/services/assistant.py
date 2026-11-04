@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import secrets
@@ -15,6 +16,7 @@ from ..core.config import get_settings
 from ..models import Order, OrderItem, Service
 from ..schemas import ChatIn, ItemIn
 from .pricing import calculate_quote
+from .selection import update_selection
 from ..seed import FAQ
 
 logger = logging.getLogger(__name__)
@@ -55,22 +57,25 @@ def _llm_warning(exc: Exception, model: str) -> str:
     return f"{invalid} некорректный ответ. Показан ответ demo-режима."
 
 
-def _call_llm(messages: list[dict[str, str]]) -> str:
+def _call_llm(messages: list[dict[str, str]], *, json_mode: bool = False) -> str:
     settings = get_settings()
     response = None
     started_at = time.monotonic()
     for attempt in range(len(LLM_RETRY_DELAYS) + 1):
         try:
+            request_body: dict[str, Any] = {
+                "model": settings.llm_model,
+                "messages": messages,
+                "max_tokens": getattr(settings, "llm_max_tokens", 350),
+                "temperature": 0.2,
+                "stream": False,
+            }
+            if json_mode:
+                request_body["response_format"] = {"type": "json_object"}
             response = httpx.post(
                 f"{settings.llm_base_url.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                json={
-                    "model": settings.llm_model,
-                    "messages": messages,
-                    "max_tokens": getattr(settings, "llm_max_tokens", 350),
-                    "temperature": 0.2,
-                    "stream": False,
-                },
+                json=request_body,
                 timeout=settings.llm_timeout_seconds,
             )
             response.raise_for_status()
@@ -136,21 +141,46 @@ def _words(text: str) -> set[str]:
     return {w for w in re.findall(r"[а-яёa-z0-9]+", text.lower()) if len(w) > 2}
 
 
+SERVICE_QUERY_PATTERNS: dict[str, tuple[tuple[str, int], ...]] = {
+    "mekhanizirovannaya-shtukaturka": (
+        (r"механиз\w*\s+штукатур|\bмеханиз", 20),
+        (r"штукатур", 6),
+    ),
+    "ruchnaya-shtukaturka": (
+        (r"ручн\w*\s+штукатур", 20),
+        (r"штукатур", 6),
+    ),
+    "pokraska-vodoemulsionnaya": (
+        (r"водоэмульс", 20),
+        (r"покрас|окрас|краск", 6),
+    ),
+    "pokraska-maslyanaya": (
+        (r"маслян\w*\s+краск|маслян\w*\s+покрас", 20),
+        (r"покрас|окрас|краск", 6),
+    ),
+    "nastennaya-plitka": (
+        (r"настенн\w*\s+плит|плит\w*\s+(?:на\s+)?стен", 20),
+        (r"плит", 6),
+    ),
+    "napolnaya-plitka": (
+        (r"напольн\w*\s+плит|плит\w*\s+(?:на\s+)?пол", 20),
+        (r"плит", 6),
+    ),
+    "natyazhnoy-potolok": ((r"натяжн\w*\s+потол|потол", 10),),
+    "laminat": ((r"ламин", 10),),
+}
+
+
 def search_services(db: Session, query: str) -> list[Service]:
     words = _words(query)
-    aliases = {
-        "штукатур": "штукатур",
-        "крас": "покраск",
-        "плит": "плитк",
-        "потол": "потол",
-        "ламин": "ламин",
-    }
-    roots = {root for key, root in aliases.items() if key in query.lower()}
+    normalized = query.lower()
     ranked = []
     for service in db.scalars(select(Service).where(Service.is_active.is_(True))).all():
         text = f"{service.name} {service.category} {service.short_description}".lower()
         score = sum(1 for word in words if word in text) + sum(
-            3 for root in roots if root in text
+            weight
+            for pattern, weight in SERVICE_QUERY_PATTERNS.get(service.slug, ())
+            if re.search(pattern, normalized)
         )
         if score >= 2:
             ranked.append((score, service))
@@ -160,6 +190,147 @@ def search_services(db: Session, query: str) -> list[Service]:
             :5
         ]
     ]
+
+
+def _extract_areas(text: str) -> list[Decimal]:
+    normalized = text.lower()
+    matches = list(
+        re.finditer(
+        r"(\d+(?:[.,]\d+)?)\s*(?:м2|м²|кв(?:адрат(?:н(?:ых|ого|ые)?)?)?(?:\.?)\s*(?:м(?:етр(?:а|ов)?)?)?|квадрат(?:а|ов)?)",
+        normalized,
+        )
+    )
+    if not matches:
+        matches = list(
+            re.finditer(
+            r"площад(?:ь|ью|и)\s*(?:около\s+|примерно\s+|[-—:]\s*)?(\d+(?:[.,]\d+)?)",
+            normalized,
+            )
+        )
+    return [Decimal(match.group(1).replace(",", ".")) for match in matches]
+
+
+def _extract_area(text: str) -> Decimal | None:
+    quantities = _extract_areas(text)
+    return quantities[0] if quantities else None
+
+
+def _extract_numbers(text: str) -> set[Decimal]:
+    return {
+        Decimal(match.group(1).replace(",", "."))
+        for match in re.finditer(r"(?<!\d)(\d+(?:[.,]\d+)?)(?!\d)", text)
+    }
+
+
+def _assistant_requested_area(text: str) -> bool:
+    lower = text.lower()
+    return any(term in lower for term in ("площад", "квадратн", "м²", "кв. м"))
+
+
+def _is_affirmative(text: str) -> bool:
+    words = re.findall(r"[а-яё]+", text.lower())
+    allowed = {
+        "да",
+        "верно",
+        "правильно",
+        "точно",
+        "тоже",
+        "всё",
+        "все",
+        "так",
+        "согласен",
+        "согласна",
+    }
+    return bool(words) and set(words) <= allowed and any(
+        word in {"да", "верно", "правильно", "точно", "согласен", "согласна"}
+        for word in words
+    )
+
+
+def _confirmed_history_quantities(payload: ChatIn) -> set[Decimal]:
+    """Resolve an explicit area that the user confirms with a short affirmative."""
+    if not payload.history or not _is_affirmative(payload.message):
+        return set()
+    previous = payload.history[-1]
+    if previous.role != "assistant" or not _assistant_requested_area(previous.content):
+        return set()
+    proposed = set(_extract_areas(previous.content))
+    if not proposed:
+        return set()
+    user_numbers = {
+        quantity
+        for message in payload.history[-6:]
+        if message.role == "user"
+        for quantity in _extract_numbers(message.content)
+    }
+    return proposed & user_numbers
+
+
+def _allowed_action_quantities(payload: ChatIn) -> set[Decimal]:
+    quantities = set(_extract_areas(payload.message))
+    recent_assistant_requested_area = any(
+        message.role == "assistant" and _assistant_requested_area(message.content)
+        for message in payload.history[-2:]
+    )
+    if not quantities and recent_assistant_requested_area:
+        quantities = _extract_numbers(payload.message)
+    if not quantities:
+        quantities = _confirmed_history_quantities(payload)
+    return quantities
+
+
+def _explicit_service_slugs(text: str) -> set[str]:
+    """Return only variants named by a service-specific catalog pattern."""
+    normalized = text.lower()
+    return {
+        slug
+        for slug, patterns in SERVICE_QUERY_PATTERNS.items()
+        if patterns and re.search(patterns[0][0], normalized)
+    }
+
+
+def _confirmed_history_cart_actions(
+    db: Session, payload: ChatIn
+) -> tuple[list[dict], dict | None]:
+    """Build actions without an LLM when the user confirms a proposed known area."""
+    quantities = _confirmed_history_quantities(payload)
+    if len(quantities) != 1:
+        return [], None
+    quantity = next(iter(quantities))
+    if not Decimal("0.1") <= quantity <= Decimal("10000"):
+        return [], None
+    user_context = "\n".join(
+        message.content for message in payload.history[-6:] if message.role == "user"
+    )
+    slugs = _explicit_service_slugs(user_context)
+    if not slugs or len(slugs) > 5:
+        return [], None
+    services = db.scalars(
+        select(Service)
+        .where(Service.is_active.is_(True), Service.slug.in_(slugs))
+        .order_by(Service.sort_order, Service.name)
+    ).all()
+    if len(services) != len(slugs):
+        return [], None
+    quote = calculate_quote(
+        db,
+        [ItemIn(service_id=service.id, quantity=quantity) for service in services],
+    )
+    note = _preference_note(user_context)
+    actions = [
+        {
+            "action": "add_to_cart",
+            "service_id": line.service_id,
+            "name": line.name,
+            "unit": line.unit,
+            "quantity": line.quantity,
+            "unit_price_rub": line.unit_price_rub,
+            "line_total_rub": line.line_total_rub,
+            "note": note,
+        }
+        for line in quote.items
+    ]
+    return actions, quote.model_dump(mode="json")
 
 
 def _calculated_cart_actions(db: Session, query: str) -> tuple[list[dict], dict | None]:
@@ -172,11 +343,10 @@ def _calculated_cart_actions(db: Session, query: str) -> tuple[list[dict], dict 
     items: list[ItemIn] = []
     seen: set[int] = set()
     for segment in segments:
-        number = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:м2|м²|кв(?:\.?\s*м)?)", segment.lower())
+        quantity = _extract_area(segment)
         matches = search_services(db, segment)
-        if not number or not matches:
+        if quantity is None or not matches:
             continue
-        quantity = Decimal(number.group(1).replace(",", "."))
         service = matches[0]
         if service.id in seen or not Decimal("0.1") <= quantity <= Decimal("10000"):
             continue
@@ -225,6 +395,104 @@ def _preference_note(text: str) -> str | None:
     return None
 
 
+def _llm_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | None]:
+    """Accept LLM service proposals only after strict catalog and price validation."""
+    explicit_quantities = _allowed_action_quantities(payload)
+    if not explicit_quantities:
+        return [], None
+    services = db.scalars(
+        select(Service)
+        .where(Service.is_active.is_(True))
+        .order_by(Service.sort_order, Service.name)
+    ).all()
+    by_slug = {service.slug: service for service in services}
+    catalog = "\n".join(
+        f"- {service.slug}: {service.name} ({service.unit})" for service in services
+    )
+    safe_message = re.sub(
+        r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
+        "[персональные данные скрыты]",
+        payload.message,
+    )
+    safe_history = [
+        {
+            "role": message.role,
+            "content": re.sub(
+                r"[\w.+-]+@[\w.-]+|(?:\+7|8)[\d\s()\-]{9,}",
+                "[персональные данные скрыты]",
+                message.content,
+            ),
+        }
+        for message in payload.history[-6:]
+    ]
+    try:
+        raw = _call_llm(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты — машинный классификатор услуг. Верни только JSON вида "
+                        '{"items":[{"service_slug":"slug","quantity":"25"}]}. '
+                        "Выбирай только slug из каталога. Добавляй позицию только если "
+                        "услуга однозначно следует из текущего сообщения или истории, а "
+                        "количество явно указано пользователем либо подтверждено коротким "
+                        "ответом на вопрос ассистента о той же площади. "
+                        "Свяжи каждое число с правильной ранее выбранной услугой. Иначе "
+                        "верни {\"items\":[]}. Не вычисляй цены.\n"
+                        f"Каталог:\n{catalog}"
+                    ),
+                },
+                *safe_history,
+                {"role": "user", "content": safe_message},
+            ],
+            json_mode=True,
+        )
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.info("LLM action proposal ignored: error=%s", type(exc).__name__)
+        return [], None
+    proposals = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(proposals, list) or len(proposals) > 5:
+        return [], None
+    items: list[ItemIn] = []
+    seen: set[int] = set()
+    for proposal in proposals:
+        if not isinstance(proposal, dict):
+            return [], None
+        service = by_slug.get(proposal.get("service_slug"))
+        try:
+            quantity = Decimal(str(proposal.get("quantity")))
+        except Exception:
+            return [], None
+        if (
+            service is None
+            or quantity not in explicit_quantities
+            or service.id in seen
+            or not Decimal("0.1") <= quantity <= Decimal("10000")
+        ):
+            return [], None
+        items.append(ItemIn(service_id=service.id, quantity=quantity))
+        seen.add(service.id)
+    if not items:
+        return [], None
+    quote = calculate_quote(db, items)
+    note = _preference_note(payload.message)
+    actions = [
+        {
+            "action": "add_to_cart",
+            "service_id": line.service_id,
+            "name": line.name,
+            "unit": line.unit,
+            "quantity": line.quantity,
+            "unit_price_rub": line.unit_price_rub,
+            "line_total_rub": line.line_total_rub,
+            "note": note,
+        }
+        for line in quote.items
+    ]
+    return actions, quote.model_dump(mode="json")
+
+
 def _contextual_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], dict | None]:
     if not payload.context_actions:
         return [], None
@@ -240,10 +508,8 @@ def _contextual_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], 
         return [], None
     lower = payload.message.lower()
     preference = _preference_note(payload.message)
-    quantity_match = re.search(
-        r"(\d+(?:[.,]\d+)?)\s*(?:м2|м²|кв(?:\.?\s*м)?)", lower
-    )
-    relevant = quantity_match or preference or any(
+    new_quantity = _extract_area(payload.message)
+    relevant = new_quantity is not None or preference or any(
         term in lower
         for term in (
             "корзин",
@@ -259,11 +525,8 @@ def _contextual_cart_actions(db: Session, payload: ChatIn) -> tuple[list[dict], 
     )
     if not relevant:
         return [], None
-    if quantity_match and len(payload.context_actions) != 1:
+    if new_quantity is not None and len(payload.context_actions) != 1:
         return [], None
-    new_quantity = (
-        Decimal(quantity_match.group(1).replace(",", ".")) if quantity_match else None
-    )
     items = [
         ItemIn(
             service_id=item.service_id,
@@ -382,6 +645,24 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
             "quote": None,
             "cart_actions": [],
         }
+    if any(
+        term in lower
+        for term in ("какие услуги", "что можно заказать", "что вы делаете")
+    ):
+        services = db.scalars(
+            select(Service)
+            .where(Service.is_active.is_(True))
+            .order_by(Service.sort_order, Service.name)
+        ).all()
+        names = "\n".join(f"- {service.name}" for service in services)
+        return {
+            "answer": f"### Доступные услуги\n\n{names}\n\nНазовите услугу и площадь — я выполню предварительный расчёт.",
+            "mode": "demo",
+            "sources": [{"type": "catalog", "title": "Каталог услуг"}],
+            "suggestions": [],
+            "quote": None,
+            "cart_actions": [],
+        }
     # An explicitly named service starts a fresh calculation. Conversation
     # context is only used for genuine follow-ups such as "а если 75 м²".
     matches = search_services(db, query)
@@ -452,9 +733,48 @@ def demo_client_answer(db: Session, payload: ChatIn) -> dict:
 
 def client_answer(db: Session, payload: ChatIn) -> dict:
     settings = get_settings()
-    if not _llm_configured():
-        return demo_client_answer(db, payload)
+    selection = update_selection(db, payload)
     fallback = demo_client_answer(db, payload)
+    fallback["selection"] = selection.selection
+    if selection.actions:
+        fallback["cart_actions"] = selection.actions
+        fallback["quote"] = selection.quote
+        fallback["calculation_id"] = selection.calculation_id
+        fallback["answer"] = _quote_markdown(selection.actions)
+        fallback["sources"] = [
+            {"type": "catalog", "title": "Проверенный каталог услуг"}
+        ]
+    elif selection.selection["items"]:
+        fallback["cart_actions"] = []
+        fallback["quote"] = selection.quote
+        fallback.pop("calculation_id", None)
+        incomplete = [
+            item
+            for item in selection.selection["items"]
+            if item["status"] == "incomplete"
+        ]
+        if incomplete:
+            details = "; ".join(
+                f"{item['name']}: {', '.join(item['missing_parameters'])}"
+                for item in incomplete
+            )
+            fallback["answer"] = f"Для завершения расчёта уточните: {details}."
+    elif not fallback.get("cart_actions") and not fallback.get("navigate_to"):
+        proposed_actions, proposed_quote = _confirmed_history_cart_actions(db, payload)
+        if not proposed_actions:
+            proposed_actions, proposed_quote = _llm_cart_actions(db, payload)
+        if proposed_actions:
+            fallback["cart_actions"] = proposed_actions
+            fallback["quote"] = proposed_quote
+            fallback["calculation_id"] = _version_actions(
+                proposed_actions, payload.conversation_id
+            )
+            fallback["answer"] = _quote_markdown(proposed_actions)
+            fallback["sources"] = [
+                {"type": "catalog", "title": "Проверенный каталог услуг"}
+            ]
+    if not _llm_configured():
+        return fallback
     lower = payload.message.lower()
     if fallback.get("navigate_to") or (
         payload.context_actions
@@ -474,10 +794,25 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
         )
     ):
         return fallback
-    context = "\n".join(
-        f"- {s.name}: {s.base_price_rub} ₽/{s.unit}. {s.short_description}"
-        for s in search_services(db, payload.message)
+    catalog = db.scalars(
+        select(Service)
+        .where(Service.is_active.is_(True))
+        .order_by(Service.sort_order, Service.name)
+    ).all()
+    context = "Доступный каталог (это полный список услуг):\n" + "\n".join(
+        f"- {service.name}: {service.base_price_rub} ₽/{service.unit}. "
+        f"{service.short_description}"
+        for service in catalog
     )
+    relevant_faq = [
+        (question, answer)
+        for question, answer in FAQ
+        if _words(question) & _words(payload.message)
+    ][:3]
+    if relevant_faq:
+        context += "\n\nПодходящие ответы FAQ:\n" + "\n".join(
+            f"- {question}: {answer}" for question, answer in relevant_faq
+        )
     if fallback.get("cart_actions"):
         context += "\n\nПроверенный сервером расчёт:\n" + "\n".join(
             f"- {item['name']}: {item['quantity']} {item['unit']} × "
@@ -485,6 +820,24 @@ def client_answer(db: Session, payload: ChatIn) -> dict:
             f"пожелание: {item.get('note') or 'нет'}"
             for item in fallback["cart_actions"]
         )
+        context += "\nПод ответом будет показана активная кнопка добавления."
+    else:
+        context += (
+            "\n\nПодтверждённого серверного расчёта сейчас нет. "
+            "Не говори, что кнопка добавления уже показана; попроси пользователя "
+            "уточнить услугу и площадь, если они нужны для расчёта."
+        )
+    incomplete_selection = [
+        item
+        for item in selection.selection["items"]
+        if item["status"] == "incomplete"
+    ]
+    if incomplete_selection:
+        context += "\n\nНезавершённые позиции подбора:\n" + "\n".join(
+            f"- {item['name']}: нужно уточнить {', '.join(item['missing_parameters'])}"
+            for item in incomplete_selection
+        )
+        context += "\nЗадай один вопрос по недостающим параметрам."
     if payload.cart:
         services = {
             service.id: service
